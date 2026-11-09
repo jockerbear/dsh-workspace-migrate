@@ -804,7 +804,13 @@ export function apply(ctx, config = {}) {
       await fsp.cp(here, join(dir, 'plugin', 'dsh-migrate'), {
         recursive: true,
         force: true,
-        filter: (entry) => !normalKey(entry).includes('node_modules'),
+        // Never ship VCS metadata: a local-folder install keeps .git next to
+        // index.js, and copying it would bloat every bundle and its sidecar.
+        filter: (entry) => {
+          const key = normalKey(entry)
+          if (key.includes('node_modules')) return false
+          return !key.split(/[\\/]/).includes('.git')
+        },
       })
     } catch {
       /* the plugin copy is a convenience, never a reason to fail an export */
