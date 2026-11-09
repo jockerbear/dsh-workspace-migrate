@@ -25,6 +25,13 @@ export function apply(ctx, config = {}) {
     (Array.isArray(config.excludeDirs) && config.excludeDirs.length ? config.excludeDirs : DEFAULT_EXCLUDES)
       .map((entry) => String(entry).toLowerCase()),
   )
+  // Fork patch P3: profile-configured default export root, so both machines
+  // agree on the sync-drive destination without hand-filling the UI field.
+  // Falls back to ~/.dsh/migrations exactly as upstream did.
+  const defaultOutDir =
+    typeof config.defaultOutDir === 'string' && config.defaultOutDir.trim()
+      ? resolve(config.defaultOutDir.trim())
+      : null
   const tasks = new Map()
   // Rollback may only remove what THIS process created, so a stray or forged
   // request can never delete an unrelated session or project registration.
@@ -406,7 +413,11 @@ export function apply(ctx, config = {}) {
 
   async function runExport(task, options) {
     const home = dshHome()
-    const outRoot = options.outDir && String(options.outDir).trim() ? resolve(String(options.outDir)) : join(home, 'migrations')
+    // Fork patch P3: explicit outDir wins, then config.defaultOutDir, then ~/.dsh/migrations.
+    const outRoot =
+      options.outDir && String(options.outDir).trim()
+        ? resolve(String(options.outDir))
+        : (defaultOutDir ?? join(home, 'migrations'))
     const updating = options.mode === 'update' && options.bundlePath && String(options.bundlePath).trim().length > 0
     let dir
     let previousState = null
