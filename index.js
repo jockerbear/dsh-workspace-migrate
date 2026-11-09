@@ -1,7 +1,7 @@
-import { promises as fsp } from 'node:fs'
+import { promises as fsp, createReadStream } from 'node:fs'
 import { join, resolve, basename, dirname } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
-import { randomUUID } from 'node:crypto'
+import { randomUUID, createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 
 /**
@@ -409,6 +409,104 @@ export function apply(ctx, config = {}) {
     return task
   }
 
+  // ── fork patch P2: bundle sealing (export receipt + sha256 sidecar) ─────
+
+  /** Root-level governance metadata that must not be part of the payload hash. */
+  function isSealExcluded(relative) {
+    if (relative.includes('/')) return false
+    return (
+      relative === 'dir.sha256' ||
+      (relative.startsWith('ACK-') && relative.endsWith('.json')) ||
+      relative.startsWith('RETIRED')
+    )
+  }
+
+  function sha256File(path) {
+    return new Promise((resolveHash, reject) => {
+      const hash = createHash('sha256')
+      const stream = createReadStream(path)
+      stream.on('error', reject)
+      stream.on('data', (chunk) => hash.update(chunk))
+      stream.on('end', () => resolveHash(hash.digest('hex')))
+    })
+  }
+
+  /**
+   * Fork patch P2: seal a finished bundle. The export receipt is written
+   * first (so the sidecar covers it), then every payload file is hashed into
+   * `dir.sha256` in sha256sum format — `<hex>  <rel/path>`, LF line endings,
+   * ordinal path order — byte-compatible with `scripts/migrate-govern.ps1`,
+   * which the target machine runs to verify the bundle before importing.
+   * A seal failure never fails the export: the script can re-seal later.
+   */
+  async function sealBundle(dir, stats) {
+    let version = null
+    try {
+      const pkg = JSON.parse(
+        await fsp.readFile(join(dirname(fileURLToPath(import.meta.url)), 'package.json'), 'utf8'),
+      )
+      version = pkg.version ?? null
+    } catch {
+      /* an unknown plugin version does not fail the seal */
+    }
+    const receiptName = `RECEIPT-${safeName(hostname())}-${new Date().toISOString().replace(/[:.]/g, '-')}.json`
+    const receipt = {
+      kind: 'dsh-migrate-export-receipt',
+      schema: 1,
+      createdAt: new Date().toISOString(),
+      host: hostname(),
+      bundle: basename(dir),
+      mode: stats.mode,
+      stats: {
+        sessions: stats.sessions,
+        sessionsReused: stats.sessionsReused,
+        workspaces: stats.workspaces,
+        bytes: stats.bytes,
+        filesCopied: stats.filesCopied,
+        filesUnchanged: stats.filesUnchanged,
+        filesRemoved: stats.filesRemoved,
+        bytesCopied: stats.bytesCopied,
+      },
+      plugin: { name: 'dsh-workspace-migrate', version },
+    }
+    await fsp.writeFile(join(dir, receiptName), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8')
+
+    const files = []
+    const stack = ['']
+    while (stack.length > 0) {
+      const relative = stack.pop()
+      const absolute = relative ? join(dir, relative) : dir
+      let entries
+      try {
+        entries = await fsp.readdir(absolute, { withFileTypes: true })
+      } catch {
+        continue
+      }
+      for (const entry of entries) {
+        const child = relative ? `${relative}/${entry.name}` : entry.name
+        if (entry.isDirectory()) {
+          stack.push(child)
+          continue
+        }
+        if (!entry.isFile() || isSealExcluded(child)) continue
+        files.push(child)
+      }
+    }
+    files.sort()
+    const lines = []
+    for (const relative of files) {
+      lines.push(`${await sha256File(join(dir, relative))}  ${relative}`)
+    }
+    const sidecar = lines.length > 0 ? `${lines.join('\n')}\n` : ''
+    await fsp.writeFile(join(dir, 'dir.sha256'), sidecar, 'utf8')
+    return {
+      receipt: receiptName,
+      sidecar: 'dir.sha256',
+      files: files.length,
+      sidecarSha256: createHash('sha256').update(sidecar, 'utf8').digest('hex'),
+    }
+  }
+
   // ── export ───────────────────────────────────────────────────────────────
 
   async function runExport(task, options) {
@@ -690,7 +788,7 @@ export function apply(ctx, config = {}) {
     )
     task.done += 1
 
-    return {
+    const result = {
       path: dir,
       mode: updating ? 'update' : 'full',
       sessions: manifestSessions.length,
@@ -706,6 +804,16 @@ export function apply(ctx, config = {}) {
       bytesCopied,
       warnings: fileWarnings,
     }
+    // Fork patch P2: seal every finished export (full or update) so the
+    // governance script and the importing machine can verify payload bytes.
+    try {
+      result.seal = await sealBundle(dir, result)
+    } catch (error) {
+      fileWarnings.push(
+        `导出封存失败（dir.sha256/回执未写入，可用 migrate-govern.ps1 seal 补）：${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
+    return result
   }
 
   function pickFormatVersion(snapshots) {
