@@ -18,7 +18,7 @@ const DEFAULT_EXCLUDES = ['node_modules', '.git', '.venv', 'venv', '__pycache__'
 const MAX_TASKS = 20
 
 export const name = 'dsh-migrate'
-export const inject = ['sessionPersistence', 'workspaceRegistry', 'webServer']
+export const inject = ['sessionPersistence', 'workspaceRegistry', 'webServer', 'tools']
 
 export function apply(ctx, config = {}) {
   const excludes = new Set(
@@ -248,32 +248,44 @@ export function apply(ctx, config = {}) {
   }
 
   async function listBundles() {
-    const root = join(dshHome(), 'migrations')
+    // Fork patch P3: scan the configured default export root too, so status
+    // reflects bundles living on the sync drive, not only ~/.dsh/migrations.
+    const roots = []
+    if (defaultOutDir) roots.push(defaultOutDir)
+    roots.push(join(dshHome(), 'migrations'))
     const bundles = []
-    let entries
-    try {
-      entries = await fsp.readdir(root, { withFileTypes: true })
-    } catch {
-      return bundles
-    }
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue
-      const path = join(root, entry.name)
+    const seen = new Set()
+    for (const root of roots) {
+      const rootKey = normalKey(root)
+      if (seen.has(rootKey)) continue
+      seen.add(rootKey)
+      let entries
       try {
-        const manifest = JSON.parse(await fsp.readFile(join(path, 'manifest.json'), 'utf8'))
-        if (manifest.kind !== BUNDLE_KIND) continue
-        bundles.push({
-          path,
-          name: entry.name,
-          createdAt: manifest.createdAt ?? null,
-          formatVersion: manifest.formatVersion ?? null,
-          workspaces: Array.isArray(manifest.workspaces) ? manifest.workspaces.length : 0,
-          sessions: Array.isArray(manifest.sessions) ? manifest.sessions.length : 0,
-          sourceHost: manifest.source?.host ?? null,
-          bytes: manifest.bytes ?? null,
-        })
+        entries = await fsp.readdir(root, { withFileTypes: true })
       } catch {
         continue
+      }
+      for (const entry of entries) {
+        if (!entry.isDirectory()) continue
+        const path = join(root, entry.name)
+        if (seen.has(normalKey(path))) continue
+        seen.add(normalKey(path))
+        try {
+          const manifest = JSON.parse(await fsp.readFile(join(path, 'manifest.json'), 'utf8'))
+          if (manifest.kind !== BUNDLE_KIND) continue
+          bundles.push({
+            path,
+            name: entry.name,
+            createdAt: manifest.createdAt ?? null,
+            formatVersion: manifest.formatVersion ?? null,
+            workspaces: Array.isArray(manifest.workspaces) ? manifest.workspaces.length : 0,
+            sessions: Array.isArray(manifest.sessions) ? manifest.sessions.length : 0,
+            sourceHost: manifest.source?.host ?? null,
+            bytes: manifest.bytes ?? null,
+          })
+        } catch {
+          continue
+        }
       }
     }
     bundles.sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))
@@ -534,14 +546,17 @@ export function apply(ctx, config = {}) {
       } catch {
         bundleWorkspaceIds = null
       }
-      await fsp.mkdir(join(dir, 'sessions'), { recursive: true })
     } else {
       dir = join(outRoot, `dsh-migration-${stamp()}`)
-      await fsp.mkdir(join(dir, 'sessions'), { recursive: true })
     }
 
-    task.message = '刷新会话日志…'
-    await ctx.sessionPersistence.flush()
+    // Fork patch P1: a dry run must not touch the filesystem or the live
+    // library — skip the flush, the mkdir, and every write below.
+    const dryRun = options.dryRun === true
+    if (!dryRun) {
+      task.message = '刷新会话日志…'
+      await ctx.sessionPersistence.flush()
+    }
 
     const snapshots = await ctx.sessionPersistence.list()
     const snapshotById = new Map(snapshots.map((snapshot) => [String(snapshot.header.id), snapshot]))
@@ -581,6 +596,44 @@ export function apply(ctx, config = {}) {
         return leftChild - rightChild || (left.createdAt ?? 0) - (right.createdAt ?? 0)
       })
 
+    // Fork patch P1: dry-run stops here with a full plan; nothing below runs.
+    if (dryRun) {
+      let wouldReuse = 0
+      if (previousState) {
+        for (const id of ordered) {
+          const previous = previousState.sessions?.[id]
+          const snapshot = snapshotById.get(id)
+          const sourceBytes = typeof snapshot?.sizeBytes === 'number' ? snapshot.sizeBytes : null
+          const sourceEvents = typeof snapshot?.eventCount === 'number' ? snapshot.eventCount : null
+          if (
+            previous &&
+            previous.meta &&
+            previous.meta.file &&
+            sourceBytes !== null &&
+            previous.sourceBytes === sourceBytes &&
+            previous.sourceEvents === sourceEvents &&
+            (await pathExists(join(dir, 'sessions', previous.meta.file)))
+          ) {
+            wouldReuse += 1
+          }
+        }
+      }
+      return {
+        dryRun: true,
+        path: dir,
+        outRoot,
+        mode: updating ? 'update' : 'full',
+        sessions: ordered.length,
+        sessionsWouldReuse: wouldReuse,
+        workspaces: selected.length,
+        workspaceIds: selected.map((workspace) => String(workspace.id)),
+        includeFiles: Boolean(options.includeFiles),
+        includeAttachments: Boolean(options.includeAttachments),
+        warnings: [],
+      }
+    }
+
+    await fsp.mkdir(join(dir, 'sessions'), { recursive: true })
     task.total = ordered.length + (options.includeFiles ? selected.length : 0) + 2
     const manifestSessions = []
     const includedIds = new Set()
@@ -1378,6 +1431,125 @@ export function apply(ctx, config = {}) {
   }
 
   ctx.effect(() => ctx.webServer.register({ kind: 'prefix', path: ROUTE_PREFIX, handler }))
+
+  // ── fork patch P1: model tools ──────────────────────────────────────────
+  // The HTTP routes require browser credentials, so an agent can never drive
+  // them; these tools run in-process with the Host's own identity instead.
+  // Export is gated: without apply=true it only returns a dry-run plan.
+
+  const renderJson = (value) => [{ type: 'text', text: JSON.stringify(value, null, 2) }]
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'dsh_migrate_status',
+      description:
+        'Read-only migration status: DSH home, migration bundle roots, existing bundles, workspace/session counts, and configured default export directory. Never writes files.',
+      parameters: { type: 'object', properties: {}, additionalProperties: false },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            home: { type: 'string' },
+            migrationsDir: { type: 'string' },
+            defaultOutDir: {},
+            codeVersion: { type: 'integer' },
+            workspaces: { type: 'integer' },
+            sessions: { type: 'integer' },
+            hasAttachments: { type: 'boolean' },
+            bundles: { type: 'array', items: { type: 'object' } },
+            excludes: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        render: (_args, value) => renderJson(value),
+      },
+      async execute(_args, exec) {
+        if (exec.signal.aborted) throw new Error('已取消')
+        const inv = await inventory()
+        return {
+          home: inv.home,
+          migrationsDir: inv.migrationsDir,
+          defaultOutDir,
+          codeVersion: inv.codeVersion,
+          workspaces: inv.workspaces.length,
+          sessions: inv.sessions.length,
+          hasAttachments: inv.hasAttachments,
+          bundles: inv.bundles,
+          excludes: inv.excludes,
+        }
+      },
+    }),
+  )
+
+  ctx.effect(() =>
+    ctx.tools.register({
+      name: 'dsh_migrate_export',
+      description:
+        'Export DSH workspaces and session logs into a portable migration bundle folder. Dry-run by default: returns the plan without writing; pass apply=true to actually write. mode=update incrementally refreshes an existing bundlePath. Import/rollback stay UI-only on purpose.',
+      parameters: {
+        type: 'object',
+        properties: {
+          apply: { type: 'boolean', description: 'Actually write the bundle. false (default) returns the plan only.' },
+          outDir: {
+            type: 'string',
+            description: 'Directory that will contain the bundle. Defaults to config.defaultOutDir, then ~/.dsh/migrations.',
+          },
+          mode: { type: 'string', enum: ['full', 'update'], description: 'full creates a new bundle; update refreshes bundlePath in place.' },
+          bundlePath: { type: 'string', description: 'Existing bundle directory; required when mode is update.' },
+          includeFiles: { type: 'boolean', description: 'Also copy project files into the bundle (default false).' },
+          includeAttachments: { type: 'boolean', description: 'Also copy ~/.dsh/attachments into the bundle (default false).' },
+          workspaceIds: { type: 'array', items: { type: 'string' }, description: 'Restrict the export to these workspace ids; default all.' },
+        },
+        additionalProperties: false,
+      },
+      output: {
+        schema: {
+          type: 'object',
+          properties: {
+            dryRun: { type: 'boolean' },
+            applied: { type: 'boolean' },
+            path: { type: 'string' },
+            outRoot: { type: 'string' },
+            mode: { type: 'string' },
+            sessions: { type: 'integer' },
+            sessionsReused: { type: 'integer' },
+            sessionsWouldReuse: { type: 'integer' },
+            workspaces: { type: 'integer' },
+            bytes: { type: 'integer' },
+            seal: { type: 'object' },
+            warnings: { type: 'array', items: { type: 'string' } },
+          },
+        },
+        render: (_args, value) => renderJson(value),
+      },
+      async execute(rawArgs, exec) {
+        const args = rawArgs && typeof rawArgs === 'object' ? rawArgs : {}
+        if (exec.signal.aborted) throw new Error('已取消')
+        const mode = args.mode === 'update' ? 'update' : 'full'
+        if (mode === 'update' && !(args.bundlePath && String(args.bundlePath).trim())) {
+          throw new Error("mode='update' 需要 bundlePath（已有迁移包目录）")
+        }
+        const options = {
+          dryRun: args.apply !== true,
+          outDir: typeof args.outDir === 'string' ? args.outDir : '',
+          mode,
+          bundlePath: typeof args.bundlePath === 'string' ? args.bundlePath : '',
+          includeFiles: args.includeFiles === true,
+          includeAttachments: args.includeAttachments === true,
+          workspaceIds: Array.isArray(args.workspaceIds) ? args.workspaceIds.map(String) : undefined,
+        }
+        const task = startTask('export')
+        try {
+          const result = await runExport(task, options)
+          succeed(task, result)
+          return { applied: !options.dryRun, ...result }
+        } catch (error) {
+          fail(task, error)
+          throw error
+        }
+      },
+    }),
+  )
+
   ctx.effect(() => () => {
     tasks.clear()
   })
