@@ -678,8 +678,13 @@ window.__ModuleLoader__.load({
         try {
           const value = await api.get(`/preview?path=${encodeURIComponent(path)}`)
           setPreview(value)
+          // Never pre-fill a bundle-recorded path as the import target. The
+          // F2/SEC-02 guard only works when writing to the original path is an
+          // explicit operator decision; pre-filling here made the zero-click
+          // default exactly what the guard refuses (a bundle choosing its own
+          // destination). The row keeps a placeholder showing the old path.
           const next = {}
-          for (const workspace of value.workspaces || []) next[workspace.path] = workspace.path
+          for (const workspace of value.workspaces || []) next[workspace.path] = ''
           setRemap(next)
         } catch (error) {
           setLoadError(error instanceof Error ? error.message : String(error))
@@ -842,7 +847,11 @@ window.__ModuleLoader__.load({
                     'div',
                     { style: { display: 'flex', alignItems: 'center', gap: 8 } },
                     h('button', { style: C.button, onClick: reload }, '刷新列表'),
-                    (task.result.workspaces || []).length > 0
+                    // Project creation failures already skip the workspace, but
+                    // their sessions can still have been imported; offer undo
+                    // whenever this run created either kind of record.
+                    (task.result.workspaces || []).length > 0 ||
+                    (task.result.importedSessions || []).length > 0
                       ? h('button', { style: C.button, onClick: () => undo(task.result) }, t('undo'))
                       : null,
                     undoNote ? h('span', { style: C.ok }, undoNote) : null,
