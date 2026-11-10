@@ -1210,10 +1210,18 @@ export function apply(ctx, config = {}) {
     // hash sidecar instead of a tree of small files.
     if (finalZip) {
       task.message = '压缩迁移包…'
-      const zipTmp = `${finalZip}.tmp`
-      const packedStats = await retryFs(() => zipDirectory(dir, zipTmp), 'zip')
-      await retryFs(() => fsp.rename(zipTmp, finalZip), 'zip-rename')
-      const zipSha = await sha256File(finalZip)
+      // P5 placement: compress on LOCAL staging first, then place exactly one
+      // finished file on the destination (often a sync drive). The drive never
+      // sees the intermediate tree or a .tmp litter, and a same-directory
+      // rename (which some sync clients re-upload) is avoided entirely.
+      const zipLocal = `${dir}.zip`
+      const packedStats = await retryFs(() => zipDirectory(dir, zipLocal), 'zip')
+      const zipSha = await sha256File(zipLocal)
+      await retryFs(() => fsp.copyFile(zipLocal, finalZip), 'zip-place')
+      const landedSha = await sha256File(finalZip)
+      if (landedSha !== zipSha) {
+        throw new Error(`压缩包落盘校验不符（${basename(finalZip)}），未写边车；请重试导出`)
+      }
       await retryFs(() => fsp.writeFile(`${finalZip}.sha256`, `${zipSha}  ${basename(finalZip)}\n`, 'utf8'), 'zip-sidecar')
       result.path = finalZip
       result.packed = true
@@ -1223,6 +1231,11 @@ export function apply(ctx, config = {}) {
         sidecar: `${basename(finalZip)}.sha256`,
         files: packedStats.files,
         bytes: packedStats.bytes,
+      }
+      try {
+        await retryFs(() => fsp.rm(zipLocal, { force: true }), 'zip-local')
+      } catch {
+        /* TEMP is self-healing */
       }
       if (staging) await dropStaging(staging)
     } else {
