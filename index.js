@@ -18,6 +18,18 @@ const BUNDLE_KIND = 'dsh-migration-bundle'
 const DEFAULT_EXCLUDES = ['node_modules', '.git', '.venv', 'venv', '__pycache__', '.cache', '.pnpm-store', 'dist', '.next']
 const MAX_TASKS = 20
 
+// Credential-bearing files must never cross machines, even when they happen to
+// sit inside a project directory: the README only promises `~/.dsh/.credentials.yaml`
+// is not exported, so a project-local copy or a rotated backup would otherwise
+// ride along as an ordinary "project file". Match exactly the DSH credential
+// file and its backup variants — `.env` and ordinary `*.bak` files are NOT
+// credentials and stay in scope.
+const CREDENTIAL_FILE = /^\.credentials\.ya?ml(\..+)?$/i
+
+function isCredentialFile(name) {
+  return CREDENTIAL_FILE.test(String(name))
+}
+
 export const name = 'dsh-migrate'
 export const inject = ['sessionPersistence', 'workspaceRegistry', 'webServer', 'tools']
 
@@ -229,8 +241,10 @@ export function apply(ctx, config = {}) {
    * Snapshot a directory tree as `relative/path -> [size, mtimeMs]`, skipping
    * the rebuildable directories in `skipNames`. Keys use forward slashes so a
    * bundle written on Windows can be updated from the same relative spelling.
+   * Credential-bearing files are never part of the snapshot (nor of a bundle):
+   * `onCredential(relative)` lets the caller report what was withheld.
    */
-  async function walkFiles(root, skipNames) {
+  async function walkFiles(root, skipNames, onCredential) {
     const result = new Map()
     const stack = ['']
     while (stack.length > 0) {
@@ -250,6 +264,10 @@ export function apply(ctx, config = {}) {
           continue
         }
         if (!entry.isFile()) continue
+        if (isCredentialFile(entry.name)) {
+          if (onCredential) onCredential(child)
+          continue
+        }
         try {
           const info = await fsp.stat(join(root, child))
           result.set(child, [info.size, Math.round(info.mtimeMs)])
@@ -471,7 +489,20 @@ export function apply(ctx, config = {}) {
   }
 
   async function readManifest(dir) {
-    const manifest = JSON.parse(await fsp.readFile(join(dir, 'manifest.json'), 'utf8'))
+    let text
+    try {
+      text = await fsp.readFile(join(dir, 'manifest.json'), 'utf8')
+    } catch {
+      // A mistyped / moved / still-syncing path is the common operator error;
+      // a raw ENOENT stack line is not actionable in the UI.
+      throw new Error(`迁移包不存在或不完整（缺少 manifest.json）：${dir}`)
+    }
+    let manifest
+    try {
+      manifest = JSON.parse(text)
+    } catch {
+      throw new Error(`迁移包的 manifest.json 不是合法 JSON：${dir}`)
+    }
     if (manifest.kind !== BUNDLE_KIND) throw new Error('这不是迁移包：manifest.kind 不匹配')
     if (Number(manifest.schema) > BUNDLE_SCHEMA) throw new Error(`迁移包结构版本 ${manifest.schema} 高于插件支持的 ${BUNDLE_SCHEMA}`)
     return manifest
@@ -700,7 +731,31 @@ export function apply(ctx, config = {}) {
 
   // ── export ───────────────────────────────────────────────────────────────
 
+  /**
+   * Wrap the export body so local scratch artefacts (TEMP staging tree and the
+   * locally compressed zip) are dropped even when the export fails halfway.
+   * The success path already cleans up after itself; an aborted packed export
+   * used to leave a full copy of the bundle in %TEMP% (disk litter that also
+   * looks like a usable bundle to a confused operator).
+   */
   async function runExport(task, options) {
+    const scratch = { staging: null, zipLocal: null, unverifiedZip: null }
+    try {
+      return await runExportCore(task, options, scratch)
+    } finally {
+      if (scratch.staging) await dropStaging(scratch.staging)
+      for (const path of [scratch.zipLocal, scratch.unverifiedZip]) {
+        if (!path) continue
+        try {
+          await retryFs(() => fsp.rm(path, { force: true }), 'scratch')
+        } catch {
+          /* TEMP cleanup is best effort; never mask the original error */
+        }
+      }
+    }
+  }
+
+  async function runExportCore(task, options, scratch) {
     const home = dshHome()
     // Fork patch P3: explicit outDir wins, then config.defaultOutDir, then ~/.dsh/migrations.
     const outRoot =
@@ -720,6 +775,9 @@ export function apply(ctx, config = {}) {
     let bundleWorkspaceIds = null
     if (updating) {
       const target = resolve(String(options.bundlePath))
+      // Friendly failure before any read/write: a moved or mistyped path used
+      // to surface a raw ENOENT for both zip and folder targets.
+      if (!(await pathExists(target))) throw new Error(`迁移包不存在：${target}`)
       const zipTarget = isZipPath(target)
       finalZip = zipTarget ? target : null
       if (zipTarget && dryRun) {
@@ -745,6 +803,7 @@ export function apply(ctx, config = {}) {
         if (zipTarget) {
           // P5: update a zip envelope via local staging, then repack at the end.
           staging = newStaging('stage')
+          scratch.staging = staging
           await fsp.mkdir(staging, { recursive: true })
           await zipExtract(target, staging)
           dir = staging
@@ -766,6 +825,7 @@ export function apply(ctx, config = {}) {
       }
     } else if (pack) {
       staging = newStaging('stage')
+      if (!dryRun) scratch.staging = staging
       dir = staging
       finalZip = join(outRoot, `dsh-migration-${stamp()}.zip`)
     } else {
@@ -879,10 +939,13 @@ export function apply(ctx, config = {}) {
 
     // Fork audit fix (SEC-09): mark the bundle incomplete until manifest.json
     // lands, so an interrupted export is visible instead of masquerading.
-    await fsp.mkdir(dir, { recursive: true })
-    await fsp.writeFile(join(dir, '.partial'), `${new Date().toISOString()}\n`, 'utf8')
+    // Fork audit hotfix: every write below may land on a sync drive when
+    // pack=false, so each one goes through retryFs (a finished export must not
+    // fail because the sync client held a just-touched directory/file).
+    await retryFs(() => fsp.mkdir(dir, { recursive: true }), 'bundle-dir')
+    await retryFs(() => fsp.writeFile(join(dir, '.partial'), `${new Date().toISOString()}\n`, 'utf8'), '.partial')
 
-    await fsp.mkdir(join(dir, 'sessions'), { recursive: true })
+    await retryFs(() => fsp.mkdir(join(dir, 'sessions'), { recursive: true }), 'sessions-dir')
     task.total = ordered.length + (options.includeFiles ? selected.length : 0) + 2
     const manifestSessions = []
     const includedIds = new Set()
@@ -979,7 +1042,7 @@ export function apply(ctx, config = {}) {
       archived: sets.archived.filter((id) => includedIds.has(id)),
       pinned: sets.pinned.filter((id) => includedIds.has(id)),
     }
-    await fsp.writeFile(join(dir, 'workspaces.json'), JSON.stringify(workspaceDoc, null, 2))
+    await retryFs(() => fsp.writeFile(join(dir, 'workspaces.json'), JSON.stringify(workspaceDoc, null, 2)), 'workspaces.json')
 
     const fileWarnings = []
     // Guard against packaging the bundle into itself: compare against the
@@ -990,6 +1053,10 @@ export function apply(ctx, config = {}) {
     let filesUnchanged = 0
     let filesRemoved = 0
     let bytesCopied = 0
+    // Project-local credential files withheld from the bundle (relative paths,
+    // deduplicated across workspaces and retries). Reported once in warnings.
+    const credentialSkips = new Set()
+    const recordCredentialSkip = (relative) => credentialSkips.add(String(relative))
     for (const workspace of selected) {
       if (!options.includeFiles) break
       const source = workspace.path
@@ -1005,7 +1072,7 @@ export function apply(ctx, config = {}) {
         continue
       }
       const dest = join(dir, 'files', safeName(workspace.id))
-      const current = await walkFiles(source, excludes)
+      const current = await walkFiles(source, excludes, recordCredentialSkip)
       if (updating) {
         const previousFiles = previousState.files?.[workspace.id] ?? {}
         for (const [relative, info] of current) {
@@ -1026,8 +1093,8 @@ export function apply(ctx, config = {}) {
               continue
             }
           }
-          await fsp.mkdir(dirname(target), { recursive: true })
-          await fsp.copyFile(join(source, relative), target)
+          await retryFs(() => fsp.mkdir(dirname(target), { recursive: true }), 'files-mkdir')
+          await retryFs(() => fsp.copyFile(join(source, relative), target), 'files-copy')
           filesCopied += 1
           bytesCopied += info[0]
         }
@@ -1042,18 +1109,26 @@ export function apply(ctx, config = {}) {
             fileWarnings.push(`增量清理跳过非法路径键：${relative}`)
             continue
           }
-          await fsp.rm(target, { force: true })
+          await retryFs(() => fsp.rm(target, { force: true }), 'files-remove')
           filesRemoved += 1
         }
       } else {
-        await fsp.cp(source, dest, {
-          recursive: true,
-          force: true,
-          filter: (entry) => {
-            if (normalKey(entry) === normalKey(source)) return true
-            return !excludes.has(basename(entry).toLowerCase())
-          },
-        })
+        await retryFs(
+          () =>
+            fsp.cp(source, dest, {
+              recursive: true,
+              force: true,
+              filter: (entry) => {
+                if (normalKey(entry) === normalKey(source)) return true
+                const name = basename(entry)
+                // Defence in depth: walkFiles already reports+skips credentials,
+                // but the bulk copy must never carry one either.
+                if (isCredentialFile(name)) return false
+                return !excludes.has(name.toLowerCase())
+              },
+            }),
+          'files-cp',
+        )
         filesCopied += current.size
         for (const info of current.values()) bytesCopied += info[0]
       }
@@ -1063,6 +1138,15 @@ export function apply(ctx, config = {}) {
         ? `增量更新：${workspace.title}（变更 ${filesCopied}，未变 ${filesUnchanged}）`
         : `已复制项目文件：${workspace.title}`
     }
+    // Credential files are withheld silently nowhere: the operator must know a
+    // project path contained one (they may need to move it by hand instead of
+    // assuming the bundle is complete).
+    if (credentialSkips.size > 0) {
+      const sample = [...credentialSkips].slice(0, 3).join('、')
+      fileWarnings.push(
+        `${credentialSkips.size} 个凭据类文件已跳过（不随迁移包外泄）：${sample}${credentialSkips.size > 3 ? ' 等' : ''}。如确需在新机器使用，请手工迁移并自行保管。`,
+      )
+    }
     if (updating) {
       for (const oldId of Object.keys(previousState.files ?? {})) {
         if (filesState[oldId]) continue
@@ -1071,14 +1155,14 @@ export function apply(ctx, config = {}) {
           fileWarnings.push(`增量清理跳过非法项目 id：${oldId}`)
           continue
         }
-        await fsp.rm(join(dir, 'files', safeName(oldId)), { recursive: true, force: true })
+        await retryFs(() => fsp.rm(join(dir, 'files', safeName(oldId)), { recursive: true, force: true }), 'files-remove-tree')
       }
     }
 
     let attachmentsBytes = 0
     const attachmentsRoot = join(home, 'attachments')
     if (options.includeAttachments && (await pathExists(attachmentsRoot))) {
-      await fsp.cp(attachmentsRoot, join(dir, 'attachments'), { recursive: true, force: true })
+      await retryFs(() => fsp.cp(attachmentsRoot, join(dir, 'attachments'), { recursive: true, force: true }), 'attachments-cp')
       attachmentsBytes = await dirSize(join(dir, 'attachments'))
     }
 
@@ -1092,17 +1176,17 @@ export function apply(ctx, config = {}) {
       const here = dirname(fileURLToPath(import.meta.url))
       const pluginDest = join(dir, 'plugin', 'dsh-migrate')
       const installFiles = ['package.json', 'cordis.patch.yml', 'index.js', 'zipfs.js', 'client.js', 'icon.svg', 'LICENSE', 'README.md']
-      await fsp.mkdir(pluginDest, { recursive: true })
+      await retryFs(() => fsp.mkdir(pluginDest, { recursive: true }), 'plugin-mkdir')
       for (const name of installFiles) {
         const sourceFile = join(here, name)
-        if (await pathExists(sourceFile)) await fsp.copyFile(sourceFile, join(pluginDest, name))
+        if (await pathExists(sourceFile)) await retryFs(() => fsp.copyFile(sourceFile, join(pluginDest, name)), 'plugin-copy')
       }
       const localeSource = join(here, 'locale')
       if (await pathExists(localeSource)) {
-        await fsp.mkdir(join(pluginDest, 'locale'), { recursive: true })
+        await retryFs(() => fsp.mkdir(join(pluginDest, 'locale'), { recursive: true }), 'plugin-mkdir')
         for (const entry of await fsp.readdir(localeSource, { withFileTypes: true })) {
           if (entry.isFile() && entry.name.endsWith('.json')) {
-            await fsp.copyFile(join(localeSource, entry.name), join(pluginDest, 'locale', entry.name))
+            await retryFs(() => fsp.copyFile(join(localeSource, entry.name), join(pluginDest, 'locale', entry.name)), 'plugin-copy')
           }
         }
       }
@@ -1215,16 +1299,24 @@ export function apply(ctx, config = {}) {
       // sees the intermediate tree or a .tmp litter, and a same-directory
       // rename (which some sync clients re-upload) is avoided entirely.
       const zipLocal = `${dir}.zip`
+      scratch.zipLocal = zipLocal
       const packedStats = await retryFs(() => zipDirectory(dir, zipLocal), 'zip')
       const zipSha = await sha256File(zipLocal)
       // The destination root may not exist yet (folder bundles created it
       // implicitly via mkdir recursive; packed ones never touch it until now).
       await retryFs(() => fsp.mkdir(dirname(finalZip), { recursive: true }), 'outRoot')
       await retryFs(() => fsp.copyFile(zipLocal, finalZip), 'zip-place')
+      // Until its hash is verified, a zip on the destination is not a finished
+      // bundle: if anything below fails, the wrapper deletes the unverified
+      // archive instead of leaving it on the sync drive. Once the content hash
+      // matches, keep the zip even if the transfer sidecar cannot be written
+      // (a verified zip is recoverable with migrate-govern.ps1 seal).
+      scratch.unverifiedZip = finalZip
       const landedSha = await sha256File(finalZip)
       if (landedSha !== zipSha) {
         throw new Error(`压缩包落盘校验不符（${basename(finalZip)}），未写边车；请重试导出`)
       }
+      scratch.unverifiedZip = null
       await retryFs(() => fsp.writeFile(`${finalZip}.sha256`, `${zipSha}  ${basename(finalZip)}\n`, 'utf8'), 'zip-sidecar')
       result.path = finalZip
       result.packed = true
@@ -1237,10 +1329,14 @@ export function apply(ctx, config = {}) {
       }
       try {
         await retryFs(() => fsp.rm(zipLocal, { force: true }), 'zip-local')
+        scratch.zipLocal = null
       } catch {
         /* TEMP is self-healing */
       }
-      if (staging) await dropStaging(staging)
+      if (staging) {
+        await dropStaging(staging)
+        scratch.staging = null
+      }
     } else {
       result.packed = false
     }
