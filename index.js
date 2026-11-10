@@ -55,6 +55,27 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  /**
+   * Retry a filesystem op briefly: sync-drive clients and antivirus scanners
+   * routinely hold just-written files for a moment (EBUSY/EPERM/EIO), which
+   * must not fail a finished export. Non-transient errors still throw fast.
+   */
+  async function retryFs(operation, label, attempts = 4) {
+    let lastError
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
+      try {
+        return await operation()
+      } catch (error) {
+        lastError = error
+        const code = error && typeof error === 'object' ? error.code : null
+        const transient = code === 'EBUSY' || code === 'EPERM' || code === 'EIO' || code === 'ENOTEMPTY' || code === 'EMFILE'
+        if (!transient || attempt === attempts - 1) throw error
+        await new Promise((resolveWait) => setTimeout(resolveWait, 200 * (attempt + 1)))
+      }
+    }
+    throw lastError
+  }
+
   /** Node's built-in Zstandard, when this runtime has it. */
   async function loadZstd() {
     try {
@@ -569,7 +590,7 @@ export function apply(ctx, config = {}) {
       },
       plugin: { name: 'dsh-workspace-migrate', version },
     }
-    await fsp.writeFile(join(dir, receiptName), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8')
+    await retryFs(() => fsp.writeFile(join(dir, receiptName), `${JSON.stringify(receipt, null, 2)}\n`, 'utf8'), receiptName)
 
     const files = []
     const stack = ['']
@@ -598,7 +619,7 @@ export function apply(ctx, config = {}) {
       lines.push(`${await sha256File(join(dir, relative))}  ${relative}`)
     }
     const sidecar = lines.length > 0 ? `${lines.join('\n')}\n` : ''
-    await fsp.writeFile(join(dir, 'dir.sha256'), sidecar, 'utf8')
+    await retryFs(() => fsp.writeFile(join(dir, 'dir.sha256'), sidecar, 'utf8'), 'dir.sha256')
     return {
       receipt: receiptName,
       sidecar: 'dir.sha256',
@@ -792,7 +813,7 @@ export function apply(ctx, config = {}) {
           const text = JSON.stringify(document)
           const packed = zstd ? zstd.zstdCompressSync(Buffer.from(text, 'utf8')) : null
           const file = packed ? `${safeName(id)}.json.zst` : `${safeName(id)}.json`
-          await fsp.writeFile(join(dir, 'sessions', file), packed ?? text)
+          await retryFs(() => fsp.writeFile(join(dir, 'sessions', file), packed ?? text), `sessions/${file}`)
           bytes += packed ? packed.length : Buffer.byteLength(text)
           includedIds.add(id)
           const meta = {
@@ -1000,16 +1021,29 @@ export function apply(ctx, config = {}) {
       archived: workspaceDoc.archived.length,
       pinned: workspaceDoc.pinned.length,
     }
-    await fsp.writeFile(join(dir, 'manifest.json.tmp'), JSON.stringify(manifest, null, 2))
-    await fsp.writeFile(
-      join(dir, 'state.json.tmp'),
-      JSON.stringify({ version: 1, createdAt: new Date().toISOString(), sessions: sessionState, files: filesState }),
+    await retryFs(() => fsp.writeFile(join(dir, 'manifest.json.tmp'), JSON.stringify(manifest, null, 2)), 'manifest.json.tmp')
+    await retryFs(
+      () =>
+        fsp.writeFile(
+          join(dir, 'state.json.tmp'),
+          JSON.stringify({ version: 1, createdAt: new Date().toISOString(), sessions: sessionState, files: filesState }),
+        ),
+      'state.json.tmp',
     )
     // Atomic-ish completion: state first, manifest last (its presence marks a
     // usable bundle), then lift the incomplete marker (SEC-09).
-    await fsp.rename(join(dir, 'state.json.tmp'), join(dir, 'state.json'))
-    await fsp.rename(join(dir, 'manifest.json.tmp'), join(dir, 'manifest.json'))
-    await fsp.rm(join(dir, '.partial'), { force: true })
+    await retryFs(() => fsp.rename(join(dir, 'state.json.tmp'), join(dir, 'state.json')), 'state.json')
+    await retryFs(() => fsp.rename(join(dir, 'manifest.json.tmp'), join(dir, 'manifest.json')), 'manifest.json')
+    // Marker cleanup must never fail a finished export: sync-drive clients
+    // hold just-written files briefly (EBUSY on unlink is common), and the
+    // marker is cosmetic — manifest.json is the real completion signal.
+    try {
+      await retryFs(() => fsp.rm(join(dir, '.partial'), { force: true }), '.partial')
+    } catch (error) {
+      fileWarnings.push(
+        `导出已完成，但 .partial 标记清理被文件占用（同步盘/杀毒扫描常见，包内容完整）：${error instanceof Error ? error.message : String(error)}。可手动删除该文件，不影响导入。`,
+      )
+    }
     task.done += 1
 
     if (sessionsFailed.length > 0) {
