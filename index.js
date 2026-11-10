@@ -1217,6 +1217,9 @@ export function apply(ctx, config = {}) {
       const zipLocal = `${dir}.zip`
       const packedStats = await retryFs(() => zipDirectory(dir, zipLocal), 'zip')
       const zipSha = await sha256File(zipLocal)
+      // The destination root may not exist yet (folder bundles created it
+      // implicitly via mkdir recursive; packed ones never touch it until now).
+      await retryFs(() => fsp.mkdir(dirname(finalZip), { recursive: true }), 'outRoot')
       await retryFs(() => fsp.copyFile(zipLocal, finalZip), 'zip-place')
       const landedSha = await sha256File(finalZip)
       if (landedSha !== zipSha) {
