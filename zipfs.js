@@ -42,6 +42,10 @@ const SIG_EOCD = 0x06054b50
 const FLAG_UTF8 = 0x0800
 const MAX_ENTRY_BYTES = 2 * 1024 * 1024 * 1024 // refuse >2GB entries (zip-bomb guard)
 
+// Win32 device names are resolved before the filesystem sees them; an entry
+// named e.g. "CON" would write to the console device instead of a file.
+const WINDOWS_RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i
+
 // Payload that is already compressed gains nothing from deflate.
 const STORED_EXT = new Set(['.zst', '.zip', '.png', '.jpg', '.jpeg', '.gif', '.webp', '.gz', '.br', '.woff', '.woff2'])
 
@@ -151,8 +155,16 @@ function readCentralDirectory(buffer) {
   }
   if (eocdAt < 0) throw new Error('zip 结构损坏：找不到中央目录结尾')
   const count = buffer.readUInt16LE(eocdAt + 10)
+  const cdSize = buffer.readUInt32LE(eocdAt + 12)
   let cursor = buffer.readUInt32LE(eocdAt + 16)
+  // zip64 sentinels mean the real values live in the zip64 record — this
+  // reader has no zip64 support, so say so instead of misreading 0xffff as a
+  // literal count (which surfaced as a confusing "central directory invalid").
+  if (count === 0xffff || cdSize === 0xffffffff || cursor === 0xffffffff) {
+    throw new Error('zip 包使用了 zip64 扩展（条目数或体积超过 4GB/65535），当前实现不支持；请改用 pack:false 的文件夹形态')
+  }
   const entries = []
+  const seenNames = new Set()
   for (let index = 0; index < count; index += 1) {
     if (cursor + 46 > buffer.length || buffer.readUInt32LE(cursor) !== SIG_CENTRAL) {
       throw new Error('zip 结构损坏：中央目录条目非法')
@@ -165,7 +177,16 @@ function readCentralDirectory(buffer) {
     const extraLen = buffer.readUInt16LE(cursor + 30)
     const commentLen = buffer.readUInt16LE(cursor + 32)
     const localOffset = buffer.readUInt32LE(cursor + 42)
+    if (cursor + 46 + nameLen + extraLen + commentLen > buffer.length) {
+      throw new Error('zip 结构损坏：中央目录条目越界')
+    }
     const name = buffer.toString('utf8', cursor + 46, cursor + 46 + nameLen)
+    // Duplicate / case-colliding names are ambiguous: zipReadEntry takes the
+    // first match while extraction lets the last one win, so different
+    // readers can see different payloads for one archive. Refuse outright.
+    const collisionKey = name.toLowerCase()
+    if (seenNames.has(collisionKey)) throw new Error(`zip 条目名重复或大小写冲突：${name}`)
+    seenNames.add(collisionKey)
     entries.push({ name, method, crc, csize, usize, localOffset })
     cursor += 46 + nameLen + extraLen + commentLen
   }
@@ -193,7 +214,14 @@ function entryPayload(buffer, entry) {
   return content
 }
 
-/** Entry path must stay under destDir; refuse traversal/absolute names (zip-slip). */
+/**
+ * Entry path must stay under destDir; refuse traversal/absolute names (zip-slip).
+ * Names are also checked for portability: Windows silently maps reserved DOS
+ * device names, strips trailing dots/spaces and rejects `< > : " | ? *`, so an
+ * archive entry spelled that way could land on a different file (or a device)
+ * than the sealed one. Refusing is fail-closed and keeps extraction identical
+ * to the tree that was hashed.
+ */
 function safeEntryTarget(destDir, name) {
   const rel = String(name).replace(/\\/g, '/')
   if (!rel || rel.includes('\0')) throw new Error(`zip 条目路径非法：${name}`)
@@ -201,6 +229,13 @@ function safeEntryTarget(destDir, name) {
   const segments = rel.split('/')
   if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
     throw new Error(`zip 条目路径非法：${name}`)
+  }
+  for (const segment of segments) {
+    if (/[<>:"|?*\x00-\x1f]/.test(segment)) throw new Error(`zip 条目路径非法（含 Windows 非法字符）：${name}`)
+    if (/[. ]$/.test(segment)) throw new Error(`zip 条目路径非法（Windows 会去掉末尾的句点或空格）：${name}`)
+    if (WINDOWS_RESERVED_NAME.test(segment.split('.')[0])) {
+      throw new Error(`zip 条目路径非法（Windows 保留设备名）：${name}`)
+    }
   }
   const root = resolve(destDir)
   const target = resolve(root, segments.join(sep))
