@@ -1,5 +1,5 @@
 import { promises as fsp, createReadStream } from 'node:fs'
-import { join, resolve, basename, dirname } from 'node:path'
+import { join, resolve, basename, dirname, sep } from 'node:path'
 import { homedir, hostname, platform } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
@@ -70,8 +70,49 @@ export function apply(ctx, config = {}) {
     return String(id).replace(/[^A-Za-z0-9._-]+/g, '_')
   }
 
+  // Fork audit fix: bundle-supplied ids and relative keys must never steer a
+  // filesystem operation outside its base directory (SEC-01/03/05).
+  function isSafePathSegment(value) {
+    const text = String(value)
+    return /^[A-Za-z0-9._-]{1,120}$/.test(text) && text !== '.' && text !== '..'
+  }
+
+  /** Validate a bundle-supplied relative path (nested allowed); reject traversal. */
+  function safeRelPath(relative) {
+    const rel = String(relative)
+    if (!rel || rel.includes('\0')) throw new Error(`非法相对路径：${rel}`)
+    if (/^[A-Za-z]:/.test(rel) || rel.startsWith('/') || rel.startsWith('\\')) throw new Error(`非法相对路径：${rel}`)
+    const segments = rel.split(/[\\/]/)
+    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+      throw new Error(`非法相对路径：${rel}`)
+    }
+    return segments.join('/')
+  }
+
+  /** Join a bundle-supplied relative path under base and assert containment. */
+  function safeJoinUnder(base, relative) {
+    const root = resolve(base)
+    const target = resolve(root, safeRelPath(relative))
+    if (target !== root && !target.startsWith(root + sep)) throw new Error(`路径越界：${relative}`)
+    return target
+  }
+
+  /** Existence probe for a bundle-supplied relative path; false when invalid. */
+  async function safePathExists(base, relative) {
+    try {
+      return await pathExists(safeJoinUnder(base, relative))
+    } catch {
+      return false
+    }
+  }
+
   function stamp() {
-    return new Date().toISOString().replace('T', '-').replace(/:/g, '').slice(0, 15)
+    // Local wall-clock (what the operator sees) + seconds + random suffix, so
+    // two exports in the same minute can never collide on one directory.
+    const now = new Date()
+    const pad = (value) => String(value).padStart(2, '0')
+    const local = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`
+    return `${local}-${randomUUID().slice(0, 4)}`
   }
 
   function normalKey(path) {
@@ -284,6 +325,12 @@ export function apply(ctx, config = {}) {
             bytes: manifest.bytes ?? null,
           })
         } catch {
+          // Fork audit fix (SEC-09): an interrupted export leaves a bundle
+          // directory without a manifest (often with a .partial marker).
+          // Surface it as incomplete instead of hiding it from the operator.
+          if (await pathExists(join(path, '.partial'))) {
+            bundles.push({ path, name: entry.name, incomplete: true, createdAt: null, sessions: 0, workspaces: 0 })
+          }
           continue
         }
       }
@@ -428,6 +475,7 @@ export function apply(ctx, config = {}) {
     if (relative.includes('/')) return false
     return (
       relative === 'dir.sha256' ||
+      relative === '.partial' ||
       (relative.startsWith('ACK-') && relative.endsWith('.json')) ||
       relative.startsWith('RETIRED')
     )
@@ -441,6 +489,46 @@ export function apply(ctx, config = {}) {
       stream.on('data', (chunk) => hash.update(chunk))
       stream.on('end', () => resolveHash(hash.digest('hex')))
     })
+  }
+
+  /**
+   * Fork audit fix (SEC-08): verify a bundle's `dir.sha256` payload hashes so
+   * the import side can refuse a bundle that changed after it was sealed.
+   * Same sha256sum semantics as sealBundle and migrate-govern.ps1.
+   */
+  async function verifySidecar(dir) {
+    let text
+    try {
+      text = await fsp.readFile(join(dir, 'dir.sha256'), 'utf8')
+    } catch {
+      return { checked: false, match: false, differences: ['缺少 dir.sha256 边车文件'] }
+    }
+    const differences = []
+    let checked = 0
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      const match = /^([0-9a-f]{64})  (.+)$/.exec(line)
+      if (!match) {
+        differences.push(`边车行格式非法：${line.slice(0, 80)}`)
+        continue
+      }
+      const [, expected, relative] = match
+      let target
+      try {
+        target = safeJoinUnder(dir, relative)
+      } catch {
+        differences.push(`边车路径越界：${relative}`)
+        continue
+      }
+      checked += 1
+      if (!(await pathExists(target))) {
+        differences.push(`包内缺少文件：${relative}`)
+        continue
+      }
+      const actual = await sha256File(target)
+      if (actual !== expected) differences.push(`内容不匹配：${relative}`)
+    }
+    return { checked, match: differences.length === 0, differences: differences.slice(0, 20) }
   }
 
   /**
@@ -596,6 +684,20 @@ export function apply(ctx, config = {}) {
         return leftChild - rightChild || (left.createdAt ?? 0) - (right.createdAt ?? 0)
       })
 
+    // Fork audit fix (AUD-02): never drop sessions silently. Every snapshot
+    // outside the export scope is reported with a reason.
+    const orderedSet = new Set(ordered)
+    const sessionsUnexported = snapshots
+      .map((snapshot) => String(snapshot.header.id))
+      .filter((id) => !orderedSet.has(id))
+      .map((id) => {
+        const parent = snapshotById.get(id)?.header?.parentSession
+        return {
+          id,
+          reason: parent ? '父会话不在导出范围' : '未挂载到所选工作区且无父会话链',
+        }
+      })
+
     // Fork patch P1: dry-run stops here with a full plan; nothing below runs.
     if (dryRun) {
       let wouldReuse = 0
@@ -612,7 +714,7 @@ export function apply(ctx, config = {}) {
             sourceBytes !== null &&
             previous.sourceBytes === sourceBytes &&
             previous.sourceEvents === sourceEvents &&
-            (await pathExists(join(dir, 'sessions', previous.meta.file)))
+            (await safePathExists(join(dir, 'sessions'), previous.meta.file))
           ) {
             wouldReuse += 1
           }
@@ -625,13 +727,22 @@ export function apply(ctx, config = {}) {
         mode: updating ? 'update' : 'full',
         sessions: ordered.length,
         sessionsWouldReuse: wouldReuse,
+        sessionsUnexported,
         workspaces: selected.length,
         workspaceIds: selected.map((workspace) => String(workspace.id)),
         includeFiles: Boolean(options.includeFiles),
         includeAttachments: Boolean(options.includeAttachments),
-        warnings: [],
+        warnings:
+          sessionsUnexported.length > 0
+            ? [`${sessionsUnexported.length} 个会话不在导出范围（详见 sessionsUnexported），确认后仍可继续`]
+            : [],
       }
     }
+
+    // Fork audit fix (SEC-09): mark the bundle incomplete until manifest.json
+    // lands, so an interrupted export is visible instead of masquerading.
+    await fsp.mkdir(dir, { recursive: true })
+    await fsp.writeFile(join(dir, '.partial'), `${new Date().toISOString()}\n`, 'utf8')
 
     await fsp.mkdir(join(dir, 'sessions'), { recursive: true })
     task.total = ordered.length + (options.includeFiles ? selected.length : 0) + 2
@@ -642,6 +753,7 @@ export function apply(ctx, config = {}) {
     let sessionsReused = 0
 
     const zstd = await loadZstd()
+    const sessionsFailed = []
     for (const id of ordered) {
       const snapshot = snapshotById.get(id)
       const previous = previousState?.sessions?.[id]
@@ -656,7 +768,7 @@ export function apply(ctx, config = {}) {
         sourceBytes !== null &&
         previous.sourceBytes === sourceBytes &&
         previous.sourceEvents === sourceEvents &&
-        (await pathExists(join(dir, 'sessions', previous.meta.file)))
+        (await safePathExists(join(dir, 'sessions'), previous.meta.file))
       ) {
         includedIds.add(id)
         manifestSessions.push(previous.meta)
@@ -666,41 +778,50 @@ export function apply(ctx, config = {}) {
         task.message = `复用未变化的会话 ${sessionsReused} 个`
         continue
       }
-      const handle = await ctx.sessionPersistence.open(id, 'read')
+      // Fork audit fix (AUD-01): a corrupt session log must never abort the
+      // whole export mid-write. Skip it, record the reason, keep going.
       try {
-        const { events } = await handle.read()
-        const document = {
-          header: handle.header,
-          inheritedEventCount: handle.inheritedEventCount,
-          events,
+        const handle = await ctx.sessionPersistence.open(id, 'read')
+        try {
+          const { events } = await handle.read()
+          const document = {
+            header: handle.header,
+            inheritedEventCount: handle.inheritedEventCount,
+            events,
+          }
+          const text = JSON.stringify(document)
+          const packed = zstd ? zstd.zstdCompressSync(Buffer.from(text, 'utf8')) : null
+          const file = packed ? `${safeName(id)}.json.zst` : `${safeName(id)}.json`
+          await fsp.writeFile(join(dir, 'sessions', file), packed ?? text)
+          bytes += packed ? packed.length : Buffer.byteLength(text)
+          includedIds.add(id)
+          const meta = {
+            id,
+            file,
+            compressed: Boolean(packed),
+            createdAt: handle.header.createdAt ?? null,
+            cwd: handle.header.cwd ?? null,
+            parent: handle.header.parentSession ? String(handle.header.parentSession) : null,
+            seeded: Boolean(handle.header.isSeeded),
+            inherited: handle.inheritedEventCount ?? 0,
+            events: Array.isArray(events) ? events.length : 0,
+          }
+          manifestSessions.push(meta)
+          sessionState[id] = {
+            meta,
+            sourceBytes,
+            sourceEvents,
+            bytes: packed ? packed.length : Buffer.byteLength(text),
+            events: Array.isArray(events) ? events.length : 0,
+          }
+        } finally {
+          await handle.close()
         }
-        const text = JSON.stringify(document)
-        const packed = zstd ? zstd.zstdCompressSync(Buffer.from(text, 'utf8')) : null
-        const file = packed ? `${safeName(id)}.json.zst` : `${safeName(id)}.json`
-        await fsp.writeFile(join(dir, 'sessions', file), packed ?? text)
-        bytes += packed ? packed.length : Buffer.byteLength(text)
-        includedIds.add(id)
-        const meta = {
-          id,
-          file,
-          compressed: Boolean(packed),
-          createdAt: handle.header.createdAt ?? null,
-          cwd: handle.header.cwd ?? null,
-          parent: handle.header.parentSession ? String(handle.header.parentSession) : null,
-          seeded: Boolean(handle.header.isSeeded),
-          inherited: handle.inheritedEventCount ?? 0,
-          events: Array.isArray(events) ? events.length : 0,
-        }
-        manifestSessions.push(meta)
-        sessionState[id] = {
-          meta,
-          sourceBytes,
-          sourceEvents,
-          bytes: packed ? packed.length : Buffer.byteLength(text),
-          events: Array.isArray(events) ? events.length : 0,
-        }
-      } finally {
-        await handle.close()
+      } catch (error) {
+        sessionsFailed.push({ id, reason: error instanceof Error ? error.message : String(error) })
+        task.done += 1
+        task.message = `跳过读取失败的会话 ${sessionsFailed.length} 个…`
+        continue
       }
       task.done += 1
       task.message = `已导出会话 ${task.done}/${ordered.length}`
@@ -749,11 +870,22 @@ export function apply(ctx, config = {}) {
         const previousFiles = previousState.files?.[workspace.id] ?? {}
         for (const [relative, info] of current) {
           const before = previousFiles[relative]
-          if (before && before[0] === info[0] && before[1] === info[1] && (await pathExists(join(dest, relative)))) {
-            filesUnchanged += 1
+          let target
+          try {
+            target = safeJoinUnder(dest, relative)
+          } catch {
             continue
           }
-          const target = join(dest, relative)
+          if (before && before[0] === info[0] && before[1] === info[1] && (await pathExists(target))) {
+            // Fork audit fix (SEC-06): reuse only when the packaged copy still
+            // matches its source bytes — never trust size/mtime alone.
+            const sourceHash = await sha256File(join(source, relative))
+            const targetHash = await sha256File(target)
+            if (sourceHash === targetHash) {
+              filesUnchanged += 1
+              continue
+            }
+          }
           await fsp.mkdir(dirname(target), { recursive: true })
           await fsp.copyFile(join(source, relative), target)
           filesCopied += 1
@@ -761,7 +893,16 @@ export function apply(ctx, config = {}) {
         }
         for (const relative of Object.keys(previousFiles)) {
           if (current.has(relative)) continue
-          await fsp.rm(join(dest, relative), { force: true })
+          // Fork audit fix (SEC-01): deletion keys come from the bundle's
+          // state.json — refuse anything that would escape the bundle.
+          let target
+          try {
+            target = safeJoinUnder(dest, relative)
+          } catch {
+            fileWarnings.push(`增量清理跳过非法路径键：${relative}`)
+            continue
+          }
+          await fsp.rm(target, { force: true })
           filesRemoved += 1
         }
       } else {
@@ -785,7 +926,12 @@ export function apply(ctx, config = {}) {
     if (updating) {
       for (const oldId of Object.keys(previousState.files ?? {})) {
         if (filesState[oldId]) continue
-        await fsp.rm(join(dir, 'files', oldId), { recursive: true, force: true })
+        // Fork audit fix (SEC-01): ids come from state.json — validate before rm.
+        if (!isSafePathSegment(oldId)) {
+          fileWarnings.push(`增量清理跳过非法项目 id：${oldId}`)
+          continue
+        }
+        await fsp.rm(join(dir, 'files', safeName(oldId)), { recursive: true, force: true })
       }
     }
 
@@ -799,21 +945,34 @@ export function apply(ctx, config = {}) {
     const filesBytes = await dirSize(join(dir, 'files'))
     // Ship this plugin itself so the target machine can install it without a
     // separate copy; the bundle is useless there without the same plugin.
+    // Fork audit fix (ARCH-01/04): copy an explicit install-file whitelist —
+    // a path-substring filter once wiped the copy on npm-style installs, and
+    // a filter-based copy leaked docs/ and stray files into every bundle.
     try {
       const here = dirname(fileURLToPath(import.meta.url))
-      await fsp.cp(here, join(dir, 'plugin', 'dsh-migrate'), {
-        recursive: true,
-        force: true,
-        // Never ship VCS metadata: a local-folder install keeps .git next to
-        // index.js, and copying it would bloat every bundle and its sidecar.
-        filter: (entry) => {
-          const key = normalKey(entry)
-          if (key.includes('node_modules')) return false
-          return !key.split(/[\\/]/).includes('.git')
-        },
-      })
-    } catch {
-      /* the plugin copy is a convenience, never a reason to fail an export */
+      const pluginDest = join(dir, 'plugin', 'dsh-migrate')
+      const installFiles = ['package.json', 'cordis.patch.yml', 'index.js', 'client.js', 'icon.svg', 'LICENSE', 'README.md']
+      await fsp.mkdir(pluginDest, { recursive: true })
+      for (const name of installFiles) {
+        const sourceFile = join(here, name)
+        if (await pathExists(sourceFile)) await fsp.copyFile(sourceFile, join(pluginDest, name))
+      }
+      const localeSource = join(here, 'locale')
+      if (await pathExists(localeSource)) {
+        await fsp.mkdir(join(pluginDest, 'locale'), { recursive: true })
+        for (const entry of await fsp.readdir(localeSource, { withFileTypes: true })) {
+          if (entry.isFile() && entry.name.endsWith('.json')) {
+            await fsp.copyFile(join(localeSource, entry.name), join(pluginDest, 'locale', entry.name))
+          }
+        }
+      }
+      if (!(await pathExists(join(pluginDest, 'package.json')))) {
+        fileWarnings.push('插件自携带副本不完整：缺少 package.json，目标机将无法从迁移包安装插件')
+      }
+    } catch (error) {
+      fileWarnings.push(
+        `插件自携带副本失败（目标机需另行安装 dsh-workspace-migrate）：${error instanceof Error ? error.message : String(error)}`,
+      )
     }
     const totalBytes = bytes + filesBytes + attachmentsBytes
     const manifest = {
@@ -836,21 +995,40 @@ export function apply(ctx, config = {}) {
       excludes: [...excludes],
       bytes: totalBytes,
       sessions: manifestSessions,
+      skippedSessions: sessionsFailed,
       workspaces: workspaceDoc.workspaces,
       archived: workspaceDoc.archived.length,
       pinned: workspaceDoc.pinned.length,
     }
-    await fsp.writeFile(join(dir, 'manifest.json'), JSON.stringify(manifest, null, 2))
+    await fsp.writeFile(join(dir, 'manifest.json.tmp'), JSON.stringify(manifest, null, 2))
     await fsp.writeFile(
-      join(dir, 'state.json'),
+      join(dir, 'state.json.tmp'),
       JSON.stringify({ version: 1, createdAt: new Date().toISOString(), sessions: sessionState, files: filesState }),
     )
+    // Atomic-ish completion: state first, manifest last (its presence marks a
+    // usable bundle), then lift the incomplete marker (SEC-09).
+    await fsp.rename(join(dir, 'state.json.tmp'), join(dir, 'state.json'))
+    await fsp.rename(join(dir, 'manifest.json.tmp'), join(dir, 'manifest.json'))
+    await fsp.rm(join(dir, '.partial'), { force: true })
     task.done += 1
+
+    if (sessionsFailed.length > 0) {
+      fileWarnings.push(
+        `${sessionsFailed.length} 个会话读取失败已跳过（详见 sessionsSkipped）：${sessionsFailed.slice(0, 3).map((entry) => entry.id).join('、')}${sessionsFailed.length > 3 ? ' 等' : ''}`,
+      )
+    }
+    if (sessionsUnexported.length > 0) {
+      fileWarnings.push(
+        `${sessionsUnexported.length} 个会话不在导出范围（详见 sessionsUnexported）：${sessionsUnexported.slice(0, 3).map((entry) => entry.id).join('、')}${sessionsUnexported.length > 3 ? ' 等' : ''}`,
+      )
+    }
 
     const result = {
       path: dir,
       mode: updating ? 'update' : 'full',
       sessions: manifestSessions.length,
+      sessionsSkipped: sessionsFailed,
+      sessionsUnexported,
       sessionsReused,
       workspaces: workspaceDoc.workspaces.length,
       bytes: totalBytes,
@@ -866,11 +1044,11 @@ export function apply(ctx, config = {}) {
     // Fork patch P2: seal every finished export (full or update) so the
     // governance script and the importing machine can verify payload bytes.
     try {
-      result.seal = await sealBundle(dir, result)
+      result.seal = { sealed: true, ...(await sealBundle(dir, result)) }
     } catch (error) {
-      fileWarnings.push(
-        `导出封存失败（dir.sha256/回执未写入，可用 migrate-govern.ps1 seal 补）：${error instanceof Error ? error.message : String(error)}`,
-      )
+      const message = error instanceof Error ? error.message : String(error)
+      result.seal = { sealed: false, error: message }
+      fileWarnings.unshift(`⚠ 导出封存失败（dir.sha256/回执未写入，可用 migrate-govern.ps1 seal 补封）：${message}`)
     }
     return result
   }
@@ -887,10 +1065,16 @@ export function apply(ctx, config = {}) {
 
   async function loadSessionDocument(dir, meta) {
     const candidates = []
-    if (meta.file) candidates.push(meta.file)
+    if (meta.file) {
+      // Fork audit fix (SEC-05): the manifest is bundle-supplied — its file
+      // name must stay inside sessions/ and never steer a path elsewhere.
+      const name = String(meta.file)
+      if (!isSafePathSegment(name)) throw new Error(`迁移包会话文件名非法：${name}`)
+      candidates.push(name)
+    }
     candidates.push(`${safeName(meta.id)}.json.zst`, `${safeName(meta.id)}.json`)
     for (const name of candidates) {
-      const full = join(dir, 'sessions', name)
+      const full = safeJoinUnder(join(dir, 'sessions'), name)
       let buffer
       try {
         buffer = await fsp.readFile(full)
@@ -909,6 +1093,10 @@ export function apply(ctx, config = {}) {
   }
 
   async function removeSessionDirs(root, id) {
+    // Fork audit fix (SEC-03): the id is bundle-supplied. A value like '..'
+    // must never resolve a delete target outside the project directory.
+    const safeId = String(id)
+    if (!isSafePathSegment(safeId)) return 0
     let removed = 0
     let projects
     try {
@@ -918,7 +1106,9 @@ export function apply(ctx, config = {}) {
     }
     for (const project of projects) {
       if (!project.isDirectory()) continue
-      const target = join(root, project.name, id)
+      const projectRoot = resolve(join(root, project.name))
+      const target = resolve(join(projectRoot, safeId))
+      if (target === projectRoot || !target.startsWith(projectRoot + sep)) continue
       if (await pathExists(target)) {
         await fsp.rm(target, { recursive: true, force: true })
         removed += 1
@@ -1051,9 +1241,13 @@ export function apply(ctx, config = {}) {
       }
     }
     const attachmentsInBundle = await pathExists(join(dir, 'attachments'))
+    // Fork audit fix (SEC-08): the pre-import check surface reports payload
+    // integrity whenever the bundle carries a sealed sidecar.
+    const integrity = await verifySidecar(dir)
     return {
       path: dir,
       sessions: (manifest.sessions ?? []).length,
+      integrity,
       scanned,
       attachmentsInBundle,
       attachmentService: Boolean(ctx.get('attachments')),
@@ -1073,6 +1267,15 @@ export function apply(ctx, config = {}) {
     const dir = resolve(String(options.bundlePath ?? ''))
     if (!options.bundlePath) throw new Error('缺少迁移包路径')
     const manifest = await readManifest(dir)
+    // Fork audit fix (SEC-08): when the bundle carries a sealed sidecar,
+    // verify it before touching the live library. A mismatch is refused
+    // unless the operator explicitly opts out via skipIntegrityCheck.
+    const integrity = await verifySidecar(dir)
+    if (integrity.checked && !integrity.match && options.skipIntegrityCheck !== true) {
+      throw new Error(
+        `迁移包完整性校验失败（${integrity.differences.length} 处差异：${integrity.differences.slice(0, 3).join('；')}）。已拒绝导入；如确认无碍，请显式传 skipIntegrityCheck 重试。`,
+      )
+    }
     const workspaceDoc = JSON.parse(await fsp.readFile(join(dir, 'workspaces.json'), 'utf8'))
     const rootDir =
       options.rootDir && String(options.rootDir).trim() ? resolve(normalizeTargetPath(options.rootDir)) : null
@@ -1099,7 +1302,11 @@ export function apply(ctx, config = {}) {
         }
         target = candidate
       } else {
-        target = workspace.path
+        // Fork audit fix (SEC-02): the bundled workspace.path is data from the
+        // bundle, not a decision by this machine's operator. Writing there by
+        // default let a crafted bundle choose any destination. Require the
+        // operator to name a new root (or explicit per-project targets) instead.
+        throw new Error('未指定导入目标：请填写「新根目录」（rootDir）或为每个项目提供显式目标（remap），拒绝默认写入迁移包内记录的原始路径')
       }
       usedTargets.add(normalKey(target))
       targets.push({ source: workspace, target })
@@ -1133,6 +1340,11 @@ export function apply(ctx, config = {}) {
       fileSkips: [],
       attachments: false,
       warnings: [],
+    }
+    if (integrity.checked && !integrity.match) {
+      report.warnings.push(
+        `迁移包边车校验有差异（${integrity.differences.length} 处），已按 skipIntegrityCheck 显式放行：${integrity.differences.slice(0, 3).join('；')}`,
+      )
     }
     const willInstallAttachments = Boolean(options.includeAttachments) && (await pathExists(join(dir, 'attachments')))
 
@@ -1187,6 +1399,13 @@ export function apply(ctx, config = {}) {
 
     for (const meta of manifest.sessions ?? []) {
       const id = String(meta.id)
+      // Fork audit fix (SEC-03): ids steer filesystem paths on rollback —
+      // anything outside the safe charset is refused up front.
+      if (!isSafePathSegment(id)) {
+        report.sessionsSkipped.push({ id, reason: '会话 id 含非法字符，已跳过' })
+        task.done += 1
+        continue
+      }
       if (existing.has(id)) {
         report.sessionsSkipped.push({ id, reason: '本机已存在同名会话' })
         task.done += 1
@@ -1194,6 +1413,15 @@ export function apply(ctx, config = {}) {
       }
       try {
         const document = await loadSessionDocument(dir, meta)
+        // Fork audit fix (SEC-04): the manifest id and the document header id
+        // are both bundle-supplied; they must agree before anything is created
+        // or registered for rollback.
+        const headerId = document.header && document.header.id != null ? String(document.header.id) : ''
+        if (headerId !== id) {
+          report.sessionsSkipped.push({ id, reason: `会话文件内 id（${headerId || '缺失'}）与清单不一致，已跳过` })
+          task.done += 1
+          continue
+        }
         if (!willInstallAttachments) {
           const audit = auditDocument(document)
           if (audit.missing > 0) {
@@ -1517,6 +1745,8 @@ export function apply(ctx, config = {}) {
             outRoot: { type: 'string' },
             mode: { type: 'string' },
             sessions: { type: 'integer' },
+            sessionsSkipped: { type: 'array', items: { type: 'object' } },
+            sessionsUnexported: { type: 'array', items: { type: 'object' } },
             sessionsReused: { type: 'integer' },
             sessionsWouldReuse: { type: 'integer' },
             workspaces: { type: 'integer' },

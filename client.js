@@ -36,7 +36,7 @@ window.__ModuleLoader__.load({
       formatVersion: '日志格式',
       sessions: '会话',
       remap: '路径映射',
-      remapHint: '新电脑没有同样的盘符或目录时，填新的目标路径；目录不存在会自动创建。',
+      remapHint: '每个项目的目标路径；留空则使用上面的「新根目录」派生。安全默认：不写迁移包记录的原始路径——新根与逐项映射至少填一项，否则拒绝导入。目录不存在会自动创建。',
       from: '原路径',
       to: '新路径',
       importFiles: '导入项目文件',
@@ -62,7 +62,7 @@ window.__ModuleLoader__.load({
       unchanged: '未变',
       removed: '已删除',
       importRoot: '导入到（新根目录）',
-      importRootHint: '每个项目会自动建一个以项目名命名的子文件夹；下面每一行仍可单独改。',
+      importRootHint: '每个项目会自动建一个以项目名命名的子文件夹；下面每一行仍可单独改。必填其一：新根或逐项映射。',
       rewritePaths: '重写对话里提到的旧路径',
       rewritePathsHint: '工具调用与结果中的旧绝对路径会换成新路径，续聊时模型才找得到文件。',
       rewrittenPaths: '重写路径',
@@ -109,7 +109,7 @@ window.__ModuleLoader__.load({
       formatVersion: 'Log format',
       sessions: 'Sessions',
       remap: 'Path mapping',
-      remapHint: 'When the new machine lacks the same drive or folder, enter the target path; missing folders are created.',
+      remapHint: 'Target path per project; leave empty to derive it from the new root above. Safety default: never writes to the bundle-recorded original paths — provide a root or per-row targets, otherwise the import is refused. Missing folders are created.',
       from: 'From',
       to: 'To',
       importFiles: 'Import project files',
@@ -135,7 +135,7 @@ window.__ModuleLoader__.load({
       unchanged: 'unchanged',
       removed: 'removed',
       importRoot: 'Import into (new root)',
-      importRootHint: 'Each project gets a subfolder named after it; every row below can still be edited.',
+      importRootHint: 'Each project gets a subfolder named after it; every row below can still be edited. Required: a root or a target per row.',
       rewritePaths: 'Rewrite old paths mentioned in conversations',
       rewritePathsHint: 'Absolute paths inside tool calls and results are replaced with the new ones, so a resumed conversation finds its files.',
       rewrittenPaths: 'paths rewritten',
@@ -645,7 +645,7 @@ window.__ModuleLoader__.load({
           const name = String(workspace.title || workspace.path)
             .replace(/[\\/:*?"<>|]/g, ' ')
             .trim()
-          next[workspace.path] = base ? `${base}${separator}${name}` : workspace.path
+          next[workspace.path] = base ? `${base}${separator}${name}` : ''
         }
         setRemap(next)
       }
@@ -790,7 +790,8 @@ window.__ModuleLoader__.load({
                   h('div', { style: C.mono }, `${t('from')}: ${workspace.path}`),
                   h('input', {
                     style: C.input,
-                    value: remap[workspace.path] ?? workspace.path,
+                    value: remap[workspace.path] ?? '',
+                    placeholder: workspace.path,
                     onChange: (event) => setRemap({ ...remap, [workspace.path]: event.target.value }),
                     spellCheck: false,
                   }),
