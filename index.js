@@ -1,8 +1,9 @@
 import { promises as fsp, createReadStream } from 'node:fs'
 import { join, resolve, basename, dirname, sep } from 'node:path'
-import { homedir, hostname, platform } from 'node:os'
+import { homedir, hostname, platform, tmpdir } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
 import { fileURLToPath } from 'node:url'
+import { zipDirectory, zipExtract, zipReadEntry, zipCountEntries } from './zipfs.js'
 
 /**
  * Host half of the migration plugin: exports the three durable layers of a
@@ -74,6 +75,45 @@ export function apply(ctx, config = {}) {
       }
     }
     throw lastError
+  }
+
+  // ── zip transport envelope (P5) ──────────────────────────────────────────
+  // The bundle format is unchanged; a packed bundle simply travels as one
+  // .zip on the sync drive instead of a tree of small files.
+
+  function isZipPath(path) {
+    return /\.zip$/i.test(String(path ?? '').trim())
+  }
+
+  /** Unique local staging dir (always on the local disk, never the sync drive). */
+  function newStaging(prefix) {
+    return join(tmpdir(), `dsh-migrate-${prefix}`, `${stamp()}-${randomUUID().slice(0, 8)}`)
+  }
+
+  async function dropStaging(staging) {
+    try {
+      await retryFs(() => fsp.rm(staging, { recursive: true, force: true }), 'staging')
+    } catch {
+      /* staging cleanup is best effort; TEMP is self-healing */
+    }
+  }
+
+  /**
+   * Run `fn(dir)` against a folder bundle as-is, or against a .zip envelope
+   * extracted to a local sandbox that is cleaned afterwards. Zip entry paths
+   * are contained by zipfs (zip-slip refused) before anything is written.
+   */
+  async function withBundleDir(bundlePath, fn) {
+    const resolved = resolve(String(bundlePath))
+    if (!isZipPath(resolved)) return fn(resolved)
+    const staging = newStaging('unpack')
+    await fsp.mkdir(staging, { recursive: true })
+    try {
+      await zipExtract(resolved, staging)
+      return await fn(staging)
+    } finally {
+      await dropStaging(staging)
+    }
   }
 
   /** Node's built-in Zstandard, when this runtime has it. */
@@ -328,6 +368,33 @@ export function apply(ctx, config = {}) {
         continue
       }
       for (const entry of entries) {
+        // P5: packed bundles travel as one .zip; read its manifest from the
+        // central directory without extracting.
+        if (entry.isFile() && isZipPath(entry.name)) {
+          const path = join(root, entry.name)
+          if (seen.has(normalKey(path))) continue
+          seen.add(normalKey(path))
+          try {
+            const text = await zipReadEntry(path, 'manifest.json')
+            if (!text) continue
+            const manifest = JSON.parse(text.toString('utf8'))
+            if (manifest.kind !== BUNDLE_KIND) continue
+            bundles.push({
+              path,
+              name: entry.name,
+              packed: true,
+              createdAt: manifest.createdAt ?? null,
+              formatVersion: manifest.formatVersion ?? null,
+              workspaces: Array.isArray(manifest.workspaces) ? manifest.workspaces.length : 0,
+              sessions: Array.isArray(manifest.sessions) ? manifest.sessions.length : 0,
+              sourceHost: manifest.source?.host ?? null,
+              bytes: manifest.bytes ?? null,
+            })
+          } catch {
+            continue
+          }
+          continue
+        }
         if (!entry.isDirectory()) continue
         const path = join(root, entry.name)
         if (seen.has(normalKey(path))) continue
@@ -412,7 +479,10 @@ export function apply(ctx, config = {}) {
 
   async function preview(bundlePath) {
     if (!bundlePath) throw new Error('缺少迁移包路径')
-    const dir = resolve(String(bundlePath))
+    return withBundleDir(bundlePath, (dir) => previewInDir(dir))
+  }
+
+  async function previewInDir(dir) {
     const manifest = await readManifest(dir)
     let workspaces = []
     try {
@@ -638,30 +708,72 @@ export function apply(ctx, config = {}) {
         ? resolve(String(options.outDir))
         : (defaultOutDir ?? join(home, 'migrations'))
     const updating = options.mode === 'update' && options.bundlePath && String(options.bundlePath).trim().length > 0
+    // P5 transport envelope: pack=true (default) delivers ONE .zip on outDir
+    // and works in a local staging dir; pack=false keeps the folder bundle.
+    // An update keeps the target's current form (zip→zip, folder→folder).
+    const pack = options.pack !== false
+    const dryRun = options.dryRun === true
     let dir
+    let staging = null
+    let finalZip = null
     let previousState = null
     let bundleWorkspaceIds = null
     if (updating) {
-      dir = resolve(String(options.bundlePath))
-      await readManifest(dir)
-      try {
-        previousState = JSON.parse(await fsp.readFile(join(dir, 'state.json'), 'utf8'))
-      } catch {
-        throw new Error('这个迁移包没有增量状态（可能是旧版本导出的），请先做一次完整导出')
+      const target = resolve(String(options.bundlePath))
+      const zipTarget = isZipPath(target)
+      finalZip = zipTarget ? target : null
+      if (zipTarget && dryRun) {
+        // Dry runs write nothing anywhere: read bundle metadata straight out
+        // of the zip instead of extracting to staging. Reuse counts for zip
+        // envelopes are computed at execution time.
+        dir = newStaging('stage') // planned name only; never created
+        const manifestText = await zipReadEntry(target, 'manifest.json')
+        if (!manifestText) throw new Error('这个迁移包没有 manifest.json')
+        const manifest = JSON.parse(manifestText.toString('utf8'))
+        if (manifest.kind !== BUNDLE_KIND) throw new Error('这不是迁移包：manifest.kind 不匹配')
+        if (Number(manifest.schema) > BUNDLE_SCHEMA) {
+          throw new Error(`迁移包结构版本 ${manifest.schema} 高于插件支持的 ${BUNDLE_SCHEMA}`)
+        }
+        const stateText = await zipReadEntry(target, 'state.json')
+        if (!stateText) throw new Error('这个迁移包没有增量状态（可能是旧版本导出的），请先做一次完整导出')
+        previousState = JSON.parse(stateText.toString('utf8'))
+        const workspacesText = await zipReadEntry(target, 'workspaces.json')
+        if (workspacesText) {
+          bundleWorkspaceIds = (JSON.parse(workspacesText.toString('utf8')).workspaces ?? []).map((workspace) => String(workspace.id))
+        }
+      } else {
+        if (zipTarget) {
+          // P5: update a zip envelope via local staging, then repack at the end.
+          staging = newStaging('stage')
+          await fsp.mkdir(staging, { recursive: true })
+          await zipExtract(target, staging)
+          dir = staging
+        } else {
+          dir = target
+        }
+        await readManifest(dir)
+        try {
+          previousState = JSON.parse(await fsp.readFile(join(dir, 'state.json'), 'utf8'))
+        } catch {
+          throw new Error('这个迁移包没有增量状态（可能是旧版本导出的），请先做一次完整导出')
+        }
+        try {
+          const doc = JSON.parse(await fsp.readFile(join(dir, 'workspaces.json'), 'utf8'))
+          bundleWorkspaceIds = (doc.workspaces ?? []).map((workspace) => String(workspace.id))
+        } catch {
+          bundleWorkspaceIds = null
+        }
       }
-      try {
-        const doc = JSON.parse(await fsp.readFile(join(dir, 'workspaces.json'), 'utf8'))
-        bundleWorkspaceIds = (doc.workspaces ?? []).map((workspace) => String(workspace.id))
-      } catch {
-        bundleWorkspaceIds = null
-      }
+    } else if (pack) {
+      staging = newStaging('stage')
+      dir = staging
+      finalZip = join(outRoot, `dsh-migration-${stamp()}.zip`)
     } else {
       dir = join(outRoot, `dsh-migration-${stamp()}`)
     }
 
     // Fork patch P1: a dry run must not touch the filesystem or the live
     // library — skip the flush, the mkdir, and every write below.
-    const dryRun = options.dryRun === true
     if (!dryRun) {
       task.message = '刷新会话日志…'
       await ctx.sessionPersistence.flush()
@@ -741,9 +853,17 @@ export function apply(ctx, config = {}) {
           }
         }
       }
+      const planWarnings = []
+      if (sessionsUnexported.length > 0) {
+        planWarnings.push(`${sessionsUnexported.length} 个会话不在导出范围（详见 sessionsUnexported），确认后仍可继续`)
+      }
+      if (finalZip && updating) {
+        planWarnings.push('zip 增量的复用文件数在执行时计算（dry-run 不解压）')
+      }
       return {
         dryRun: true,
-        path: dir,
+        path: finalZip ?? dir,
+        packed: Boolean(finalZip),
         outRoot,
         mode: updating ? 'update' : 'full',
         sessions: ordered.length,
@@ -753,10 +873,7 @@ export function apply(ctx, config = {}) {
         workspaceIds: selected.map((workspace) => String(workspace.id)),
         includeFiles: Boolean(options.includeFiles),
         includeAttachments: Boolean(options.includeAttachments),
-        warnings:
-          sessionsUnexported.length > 0
-            ? [`${sessionsUnexported.length} 个会话不在导出范围（详见 sessionsUnexported），确认后仍可继续`]
-            : [],
+        warnings: planWarnings,
       }
     }
 
@@ -865,7 +982,9 @@ export function apply(ctx, config = {}) {
     await fsp.writeFile(join(dir, 'workspaces.json'), JSON.stringify(workspaceDoc, null, 2))
 
     const fileWarnings = []
-    const outKey = normalKey(dir)
+    // Guard against packaging the bundle into itself: compare against the
+    // FINAL destination (zip location or folder bundle), never the staging dir.
+    const outKey = normalKey(finalZip ? dirname(finalZip) : dir)
     const filesState = {}
     let filesCopied = 0
     let filesUnchanged = 0
@@ -972,7 +1091,7 @@ export function apply(ctx, config = {}) {
     try {
       const here = dirname(fileURLToPath(import.meta.url))
       const pluginDest = join(dir, 'plugin', 'dsh-migrate')
-      const installFiles = ['package.json', 'cordis.patch.yml', 'index.js', 'client.js', 'icon.svg', 'LICENSE', 'README.md']
+      const installFiles = ['package.json', 'cordis.patch.yml', 'index.js', 'zipfs.js', 'client.js', 'icon.svg', 'LICENSE', 'README.md']
       await fsp.mkdir(pluginDest, { recursive: true })
       for (const name of installFiles) {
         const sourceFile = join(here, name)
@@ -1083,6 +1202,31 @@ export function apply(ctx, config = {}) {
       const message = error instanceof Error ? error.message : String(error)
       result.seal = { sealed: false, error: message }
       fileWarnings.unshift(`⚠ 导出封存失败（dir.sha256/回执未写入，可用 migrate-govern.ps1 seal 补封）：${message}`)
+    }
+
+    // P5 transport envelope: compress the sealed bundle into ONE zip on the
+    // destination root (or refresh the existing one on update), drop the
+    // local staging tree. The sync drive sees a single archive + one-line
+    // hash sidecar instead of a tree of small files.
+    if (finalZip) {
+      task.message = '压缩迁移包…'
+      const zipTmp = `${finalZip}.tmp`
+      const packedStats = await retryFs(() => zipDirectory(dir, zipTmp), 'zip')
+      await retryFs(() => fsp.rename(zipTmp, finalZip), 'zip-rename')
+      const zipSha = await sha256File(finalZip)
+      await retryFs(() => fsp.writeFile(`${finalZip}.sha256`, `${zipSha}  ${basename(finalZip)}\n`, 'utf8'), 'zip-sidecar')
+      result.path = finalZip
+      result.packed = true
+      result.zip = {
+        name: basename(finalZip),
+        sha256: zipSha,
+        sidecar: `${basename(finalZip)}.sha256`,
+        files: packedStats.files,
+        bytes: packedStats.bytes,
+      }
+      if (staging) await dropStaging(staging)
+    } else {
+      result.packed = false
     }
     return result
   }
@@ -1247,7 +1391,10 @@ export function apply(ctx, config = {}) {
 
   async function auditBundle(bundlePath) {
     if (!bundlePath) throw new Error('缺少迁移包路径')
-    const dir = resolve(String(bundlePath))
+    return withBundleDir(bundlePath, (dir) => auditBundleInDir(dir))
+  }
+
+  async function auditBundleInDir(dir) {
     const manifest = await readManifest(dir)
     const problems = []
     let totalRefs = 0
@@ -1298,8 +1445,12 @@ export function apply(ctx, config = {}) {
   }
 
   async function runImport(task, options) {
-    const dir = resolve(String(options.bundlePath ?? ''))
     if (!options.bundlePath) throw new Error('缺少迁移包路径')
+    const sourcePath = resolve(String(options.bundlePath))
+    return withBundleDir(sourcePath, (dir) => runImportInDir(task, options, dir, sourcePath))
+  }
+
+  async function runImportInDir(task, options, dir, sourcePath) {
     const manifest = await readManifest(dir)
     // Fork audit fix (SEC-08): when the bundle carries a sealed sidecar,
     // verify it before touching the live library. A mismatch is refused
@@ -1359,7 +1510,7 @@ export function apply(ctx, config = {}) {
     pairs.sort((a, b) => normalKey(b.from).length - normalKey(a.from).length)
 
     const report = {
-      path: dir,
+      path: sourcePath,
       rootDir,
       workspaces: [],
       sessionsImported: 0,
@@ -1752,17 +1903,22 @@ export function apply(ctx, config = {}) {
     ctx.tools.register({
       name: 'dsh_migrate_export',
       description:
-        'Export DSH workspaces and session logs into a portable migration bundle folder. Dry-run by default: returns the plan without writing; pass apply=true to actually write. mode=update incrementally refreshes an existing bundlePath. Import/rollback stay UI-only on purpose.',
+        'Export DSH workspaces and session logs into a portable migration bundle — by default a single .zip on outDir (sync-drive friendly), or a folder with pack=false. Dry-run by default: returns the plan without writing; pass apply=true to actually write. mode=update incrementally refreshes an existing bundlePath (folder or .zip). Import/rollback stay UI-only on purpose.',
       parameters: {
         type: 'object',
         properties: {
           apply: { type: 'boolean', description: 'Actually write the bundle. false (default) returns the plan only.' },
+          pack: {
+            type: 'boolean',
+            description:
+              'Pack the sealed bundle into ONE .zip on outDir and clean local staging (default true) — ideal for sync drives. pack:false writes the folder bundle. Updates keep the target form.',
+          },
           outDir: {
             type: 'string',
             description: 'Directory that will contain the bundle. Defaults to config.defaultOutDir, then ~/.dsh/migrations.',
           },
           mode: { type: 'string', enum: ['full', 'update'], description: 'full creates a new bundle; update refreshes bundlePath in place.' },
-          bundlePath: { type: 'string', description: 'Existing bundle directory; required when mode is update.' },
+          bundlePath: { type: 'string', description: 'Existing bundle (folder or .zip); required when mode is update.' },
           includeFiles: { type: 'boolean', description: 'Also copy project files into the bundle (default false).' },
           includeAttachments: { type: 'boolean', description: 'Also copy ~/.dsh/attachments into the bundle (default false).' },
           workspaceIds: { type: 'array', items: { type: 'string' }, description: 'Restrict the export to these workspace ids; default all.' },
@@ -1786,6 +1942,8 @@ export function apply(ctx, config = {}) {
             workspaces: { type: 'integer' },
             bytes: { type: 'integer' },
             seal: { type: 'object' },
+            packed: { type: 'boolean' },
+            zip: { type: 'object' },
             warnings: { type: 'array', items: { type: 'string' } },
           },
         },
@@ -1800,6 +1958,7 @@ export function apply(ctx, config = {}) {
         }
         const options = {
           dryRun: args.apply !== true,
+          pack: args.pack !== false,
           outDir: typeof args.outDir === 'string' ? args.outDir : '',
           mode,
           bundlePath: typeof args.bundlePath === 'string' ? args.bundlePath : '',

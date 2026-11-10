@@ -21,6 +21,8 @@ window.__ModuleLoader__.load({
       files: '同时打包项目文件',
       filesHint: '排除 node_modules、.git 等可重建目录。',
       attachments: '同时打包图片附件',
+      pack: '压缩为单文件 zip（推荐）',
+      packHint: '同步盘只放 1 个压缩包 + 1 行哈希，推送/拉取出错概率最小；导入时自动解压。取消勾选则输出文件夹形态。',
       outDir: '导出位置',
       outDirHint: '留空则用 ~/.dsh/migrations。',
       startExport: '开始导出',
@@ -94,6 +96,8 @@ window.__ModuleLoader__.load({
       files: 'Include project files',
       filesHint: 'Skips rebuildable directories such as node_modules and .git.',
       attachments: 'Include image attachments',
+      pack: 'Pack as a single .zip (recommended)',
+      packHint: 'Puts one archive plus a one-line hash on the sync drive — the smallest push/pull error surface. Import extracts it automatically. Clear to write a folder bundle instead.',
       outDir: 'Export location',
       outDirHint: 'Empty uses ~/.dsh/migrations.',
       startExport: 'Start export',
@@ -409,6 +413,7 @@ window.__ModuleLoader__.load({
       const [selected, setSelected] = useState(null)
       const [includeFiles, setIncludeFiles] = useState(true)
       const [includeAttachments, setIncludeAttachments] = useState(true)
+      const [pack, setPack] = useState(true)
       const [outDir, setOutDir] = useState('')
       const [updateTarget, setUpdateTarget] = useState('')
       const [cleanupNote, setCleanupNote] = useState(null)
@@ -489,6 +494,8 @@ window.__ModuleLoader__.load({
           h('label', { style: C.label }, h(Checkbox, { checked: includeFiles, onChange: setIncludeFiles }), t('files')),
           h('div', { style: C.hint }, t('filesHint')),
           h('label', { style: C.label }, h(Checkbox, { checked: includeAttachments, onChange: setIncludeAttachments }), t('attachments')),
+          h('label', { style: C.label }, h(Checkbox, { checked: pack, onChange: setPack }), t('pack')),
+          h('div', { style: C.hint }, t('packHint')),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 5 } },
             h('div', { style: C.hint }, t('outDir')),
             h('input', {
@@ -513,6 +520,7 @@ window.__ModuleLoader__.load({
                     workspaceIds: [...active],
                     includeFiles,
                     includeAttachments,
+                    pack,
                     outDir: outDir.trim() || null,
                   }),
               },
