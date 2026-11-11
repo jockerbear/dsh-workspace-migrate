@@ -50,7 +50,7 @@
           "source": {
             "type": "git",
             "url": "https://github.com/jockerbear/dsh-workspace-migrate",
-            "commit": "3408b977662759912578d69fd9d3c0361efcf6c1"
+            "commit": "d316654d100e0ae668b6418e91672ed8cf7d288e"
           },
           "engines": {
             "dsh": "^0.2.1-rc.2"
