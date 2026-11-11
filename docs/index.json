@@ -22,17 +22,17 @@
     {
       "name": "dsh-workspace-migrate",
       "title": {
-        "en": "Workspace Migration",
-        "zh": "工作区迁移"
+        "en": "Backup and Migration",
+        "zh": "备份与迁移"
       },
       "description": {
         "en": "Package selected workspaces, their conversations, project files and image attachments into one folder, then restore them on another machine with an editable path map.",
         "zh": "把选中的工作区连同会话、项目文件与图片附件打成一个文件夹，在新机器上按可编辑的路径映射还原。"
       },
-      "author": "lij0000-arch",
-      "homepage": "https://github.com/lij0000-arch/dsh-workspace-migrate",
+      "author": "jockerbear",
+      "homepage": "https://github.com/jockerbear/dsh-workspace-migrate",
       "repository": {
-        "url": "https://github.com/lij0000-arch/dsh-workspace-migrate"
+        "url": "https://github.com/jockerbear/dsh-workspace-migrate"
       },
       "metadata": {
         "category": "session",
@@ -45,13 +45,12 @@
       },
       "versions": [
         {
-          "_note": "commit 换成 push 后的 git rev-parse HEAD（40 位小写十六进制）；发过 npm 之后可改成 {\"type\":\"npm\"}",
-          "version": "0.5.3-local.6",
-          "publishTimestamp": 1792540800,
+          "version": "0.6.0",
+          "publishTimestamp": 1794364779,
           "source": {
             "type": "git",
-            "url": "https://github.com/lij0000-arch/dsh-workspace-migrate",
-            "commit": "0000000000000000000000000000000000000000"
+            "url": "https://github.com/jockerbear/dsh-workspace-migrate",
+            "commit": "3408b977662759912578d69fd9d3c0361efcf6c1"
           },
           "engines": {
             "dsh": "^0.2.1-rc.2"

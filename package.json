@@ -1,6 +1,6 @@
 {
   "name": "dsh-workspace-migrate",
-  "version": "0.5.3-local.6",
+  "version": "0.6.0",
   "private": false,
   "type": "module",
   "description": "把 DeepSeek Harness 的工作区、项目成果和对话内容整体迁到另一台电脑",
@@ -18,11 +18,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lij0000-arch/dsh-workspace-migrate.git"
+    "url": "git+https://github.com/jockerbear/dsh-workspace-migrate.git"
   },
-  "homepage": "https://github.com/lij0000-arch/dsh-workspace-migrate#readme",
+  "homepage": "https://github.com/jockerbear/dsh-workspace-migrate#readme",
   "bugs": {
-    "url": "https://github.com/lij0000-arch/dsh-workspace-migrate/issues"
+    "url": "https://github.com/jockerbear/dsh-workspace-migrate/issues"
   },
   "exports": {
     ".": "./index.js",

@@ -1,4 +1,4 @@
-import { promises as fsp, createReadStream } from 'node:fs'
+import { promises as fsp, createReadStream, createWriteStream } from 'node:fs'
 import { join, resolve, basename, dirname, sep } from 'node:path'
 import { homedir, hostname, platform, tmpdir } from 'node:os'
 import { randomUUID, createHash } from 'node:crypto'
@@ -367,8 +367,134 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  async function listBundles() {
-    // Fork patch P3: scan the configured default export root too, so status
+  // ── remembered import targets (operator data, never bundle data) ──────────
+  // The desktop Web UI serves a fresh port on every launch, so browser storage
+  // keyed by origin would be lost; remembering the last operator-chosen import
+  // root on the local disk keeps repeated imports to one pick. Only the
+  // operator writes these values, so pre-filling SEC-02's required explicit
+  // target from them never lets a bundle choose its own destination.
+  function prefsPath() {
+    return join(dshHome(), 'migrations-prefs.json')
+  }
+
+  async function readPrefs() {
+    try {
+      const parsed = JSON.parse(await fsp.readFile(prefsPath(), 'utf8'))
+      return {
+        lastImportRootDir: typeof parsed.lastImportRootDir === 'string' ? parsed.lastImportRootDir : '',
+        lastBundlePath: typeof parsed.lastBundlePath === 'string' ? parsed.lastBundlePath : '',
+      }
+    } catch {
+      return { lastImportRootDir: '', lastBundlePath: '' }
+    }
+  }
+
+  async function savePrefs(patch) {
+    try {
+      const current = await readPrefs()
+      const next = {
+        lastImportRootDir:
+          typeof patch.lastImportRootDir === 'string' && patch.lastImportRootDir.trim()
+            ? patch.lastImportRootDir.trim()
+            : current.lastImportRootDir,
+        lastBundlePath:
+          typeof patch.lastBundlePath === 'string' && patch.lastBundlePath.trim()
+            ? patch.lastBundlePath.trim()
+            : current.lastBundlePath,
+      }
+      await retryFs(() => fsp.writeFile(prefsPath(), JSON.stringify(next, null, 2), 'utf8'), 'prefs')
+    } catch {
+      /* remembering is best effort; never fail the operator's action for it */
+    }
+  }
+
+  // ── browser bundle upload (the Web UI cannot read a host path) ───────────
+  // The UI can open its own file dialog but only receives bytes, not a path,
+  // so the chosen .zip streams to this Host once and the import runs from that
+  // local copy. Copies live under ~/.dsh (never the sync drive) and only the
+  // newest few are kept.
+  const MAX_UPLOAD_BYTES = 4 * 1024 * 1024 * 1024
+  const UPLOAD_KEEP = 8
+
+  function uploadsDir() {
+    return join(dshHome(), 'migrations-uploads')
+  }
+
+  function decodeUploadName(headerValue) {
+    const raw = String(headerValue ?? '')
+    try {
+      return decodeURIComponent(raw)
+    } catch {
+      return raw
+    }
+  }
+
+  async function pruneUploads(dir) {
+    try {
+      const entries = await fsp.readdir(dir, { withFileTypes: true })
+      const files = []
+      for (const entry of entries) {
+        if (!entry.isFile() || !isZipPath(entry.name)) continue
+        const path = join(dir, entry.name)
+        const stat = await fsp.stat(path)
+        files.push({ path, mtime: stat.mtimeMs })
+      }
+      files.sort((left, right) => right.mtime - left.mtime)
+      for (const file of files.slice(UPLOAD_KEEP)) await fsp.rm(file.path, { force: true })
+    } catch {
+      /* pruning is best effort; a stale copy is harmless */
+    }
+  }
+
+  async function receiveBundleUpload(req) {
+    const requested = decodeUploadName(req.headers['x-bundle-name'])
+    let base = safeName(basename(requested || `bundle-${stamp()}.zip`)).replace(/^_+/, '')
+    if (!base || base === '.zip') base = `bundle-${stamp()}.zip`
+    if (!/\.zip$/i.test(base)) throw new Error('只支持 .zip 迁移包；文件夹形态请用「选择文件夹」')
+    const dir = uploadsDir()
+    await fsp.mkdir(dir, { recursive: true })
+    const target = join(dir, base)
+    const temp = `${target}.partial`
+    let size = 0
+    await new Promise((resolveDone, rejectDone) => {
+      const out = createWriteStream(temp)
+      let settled = false
+      const fail = (error) => {
+        if (settled) return
+        settled = true
+        out.destroy()
+        if (typeof req.unpipe === 'function') req.unpipe(out)
+        fsp
+          .rm(temp, { force: true })
+          .catch(() => {})
+          .finally(() => rejectDone(error))
+      }
+      out.on('error', fail)
+      req.on('error', fail)
+      req.on('data', (chunk) => {
+        size += chunk.length
+        if (size > MAX_UPLOAD_BYTES) fail(new Error('迁移包超过 4 GiB；zip64 包不受支持'))
+      })
+      out.on('finish', () => {
+        if (settled) return
+        settled = true
+        resolveDone()
+      })
+      req.pipe(out)
+    })
+    if (size === 0) {
+      await fsp.rm(temp, { force: true })
+      throw new Error('上传的迁移包为空')
+    }
+    await retryFs(async () => {
+      await fsp.rm(target, { force: true })
+      await fsp.rename(temp, target)
+    }, 'bundle upload')
+    await pruneUploads(dir)
+    return { path: target, name: base, bytes: size }
+  }
+
+  async function listBundles() {    // Fork patch P3: scan the configured default export root too, so status
     // reflects bundles living on the sync drive, not only ~/.dsh/migrations.
     const roots = []
     if (defaultOutDir) roots.push(defaultOutDir)
@@ -477,6 +603,7 @@ export function apply(ctx, config = {}) {
     return {
       home,
       migrationsDir: join(home, 'migrations'),
+      prefs: await readPrefs(),
       codeVersion: 10,
       workspaces,
       sessions,
@@ -616,7 +743,7 @@ export function apply(ctx, config = {}) {
   /**
    * Fork audit fix (SEC-08): verify a bundle's `dir.sha256` payload hashes so
    * the import side can refuse a bundle that changed after it was sealed.
-   * Same sha256sum semantics as sealBundle and migrate-govern.ps1.
+   * Same sha256sum semantics as sealBundle.
    */
   async function verifySidecar(dir) {
     let text
@@ -657,9 +784,9 @@ export function apply(ctx, config = {}) {
    * Fork patch P2: seal a finished bundle. The export receipt is written
    * first (so the sidecar covers it), then every payload file is hashed into
    * `dir.sha256` in sha256sum format — `<hex>  <rel/path>`, LF line endings,
-   * ordinal path order — byte-compatible with `scripts/migrate-govern.ps1`,
-   * which the target machine runs to verify the bundle before importing.
-   * A seal failure never fails the export: the script can re-seal later.
+   * ordinal path order — stable across platforms, so any sha256sum tool
+   * can verify the bundle before importing.
+   * A seal failure never fails the export: a re-export seals it again.
    */
   async function sealBundle(dir, stats) {
     let version = null
@@ -1278,14 +1405,14 @@ export function apply(ctx, config = {}) {
       bytesCopied,
       warnings: fileWarnings,
     }
-    // Fork patch P2: seal every finished export (full or update) so the
-    // governance script and the importing machine can verify payload bytes.
+    // Fork patch P2: seal every finished export (full or update) so
+    // an external verifier and the importing machine can verify payload bytes.
     try {
       result.seal = { sealed: true, ...(await sealBundle(dir, result)) }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
       result.seal = { sealed: false, error: message }
-      fileWarnings.unshift(`⚠ 导出封存失败（dir.sha256/回执未写入，可用 migrate-govern.ps1 seal 补封）：${message}`)
+      fileWarnings.unshift(`⚠ 导出封存失败（dir.sha256/回执未写入，重新导出即可补封）：${message}`)
     }
 
     // P5 transport envelope: compress the sealed bundle into ONE zip on the
@@ -1310,7 +1437,7 @@ export function apply(ctx, config = {}) {
       // bundle: if anything below fails, the wrapper deletes the unverified
       // archive instead of leaving it on the sync drive. Once the content hash
       // matches, keep the zip even if the transfer sidecar cannot be written
-      // (a verified zip is recoverable with migrate-govern.ps1 seal).
+      // (a verified zip is still a valid bundle; only the sidecar is missing).
       scratch.unverifiedZip = finalZip
       const landedSha = await sha256File(finalZip)
       if (landedSha !== zipSha) {
@@ -1922,11 +2049,21 @@ export function apply(ctx, config = {}) {
         return
       }
       if (req.method === 'GET' && route === '/preview') {
-        sendJson(res, 200, await preview(url.searchParams.get('path')))
+        const bundlePath = url.searchParams.get('path')
+        const value = await preview(bundlePath)
+        await savePrefs({ lastBundlePath: String(bundlePath ?? '') })
+        sendJson(res, 200, value)
         return
       }
       if (req.method === 'GET' && route === '/check') {
-        sendJson(res, 200, await auditBundle(url.searchParams.get('path')))
+        const bundlePath = url.searchParams.get('path')
+        const value = await auditBundle(bundlePath)
+        await savePrefs({ lastBundlePath: String(bundlePath ?? '') })
+        sendJson(res, 200, value)
+        return
+      }
+      if (req.method === 'POST' && route === '/bundle-upload') {
+        sendJson(res, 200, await receiveBundleUpload(req))
         return
       }
       if (req.method === 'GET' && route === '/task') {
@@ -1942,6 +2079,12 @@ export function apply(ctx, config = {}) {
       }
       if (req.method === 'POST' && route === '/import') {
         const body = await readJson(req)
+        // Remember the operator's choices so the next import is one pick: the
+        // explicit target here is the operator's own (never bundle-supplied).
+        await savePrefs({
+          lastImportRootDir: typeof body.rootDir === 'string' ? body.rootDir : '',
+          lastBundlePath: typeof body.bundlePath === 'string' ? body.bundlePath : '',
+        })
         const task = startTask('import')
         runImport(task, body).then((result) => succeed(task, result)).catch((error) => fail(task, error))
         sendJson(res, 200, { taskId: task.id })
@@ -1982,6 +2125,7 @@ export function apply(ctx, config = {}) {
           properties: {
             home: { type: 'string' },
             migrationsDir: { type: 'string' },
+            prefs: {},
             defaultOutDir: {},
             codeVersion: { type: 'integer' },
             workspaces: { type: 'integer' },
@@ -1999,6 +2143,7 @@ export function apply(ctx, config = {}) {
         return {
           home: inv.home,
           migrationsDir: inv.migrationsDir,
+          prefs: await readPrefs(),
           defaultOutDir,
           codeVersion: inv.codeVersion,
           workspaces: inv.workspaces.length,

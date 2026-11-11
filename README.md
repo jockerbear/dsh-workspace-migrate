@@ -1,10 +1,10 @@
-# dsh-workspace-migrate
+# dsh-workspace-migrate（备份与迁移）
 
-[![npm](https://img.shields.io/npm/v/dsh-workspace-migrate)](https://www.npmjs.com/package/dsh-workspace-migrate)
-[![DSH Plugin Store](https://img.shields.io/badge/DSH%20Plugin%20Store-listed-4C8DFF)](https://www.dshplugin.store/plugin/lij0000-arch/dsh-workspace-migrate)
-[![release](https://img.shields.io/github/v/release/lij0000-arch/dsh-workspace-migrate?label=release)](https://github.com/lij0000-arch/dsh-workspace-migrate/releases)
-[![stars](https://img.shields.io/github/stars/lij0000-arch/dsh-workspace-migrate)](https://github.com/lij0000-arch/dsh-workspace-migrate)
-[![license](https://img.shields.io/github/license/lij0000-arch/dsh-workspace-migrate)](LICENSE)
+[![release](https://img.shields.io/github/v/release/jockerbear/dsh-workspace-migrate?label=release)](https://github.com/jockerbear/dsh-workspace-migrate/releases)
+[![stars](https://img.shields.io/github/stars/jockerbear/dsh-workspace-migrate)](https://github.com/jockerbear/dsh-workspace-migrate)
+[![license](https://img.shields.io/github/license/jockerbear/dsh-workspace-migrate)](LICENSE)
+
+> 界面显示名「**备份与迁移**」。本仓库是 [lij0000-arch/dsh-workspace-migrate](https://github.com/lij0000-arch/dsh-workspace-migrate) v0.5.3 的本地化改造版，依 [MIT License](LICENSE) 分发，上游版权归 dsh-migrate contributors；本地改动见提交历史。
 
 换电脑，把 DeepSeek Harness 里的**项目、对话和文件**一起带走，而且搬过去的旧对话还能接着聊。
 
@@ -21,20 +21,20 @@
 dsh plugin --profile desktop add dsh-workspace-migrate
 ```
 
-不想用命令行：设置 → 插件 里安装，或在一个对话里让 agent 用 `plugin_manager` 装这个仓库。装完刷新页面，**设置 → 迁移** 出现即可用。
+不想用命令行：设置 → 插件 里安装，或在一个对话里让 agent 用 `plugin_manager` 装这个仓库。装完刷新页面，**设置 → 备份与迁移** 出现即可用。
 
 > 插件按 profile 隔离：**你现在用的界面是哪个 profile，就装到哪个**。装错的表现是「装好了，但设置里看不到这个页签」。桌面端一般是 `desktop`，`dsh web` 是 `web`；不确定就执行 `echo $env:DSH_PROFILE`。
 
 ## 怎么用（两步）
 
-1. **旧电脑**：设置 → 迁移 → 导出（旧电脑）→ 勾项目 → 开始导出，默认得到一个 **`.zip` 压缩包 + 一个 `.sha256` 小边车**（同步盘上只放两个文件），拷到新电脑。
-2. **新电脑**：设置 → 迁移 → 导入 → 选包（`.zip` 可直接选）→ 填**新根目录** → 导入前体检 → 开始导入。
+1. **旧电脑**：设置 → 备份与迁移 → 导出（旧电脑）→ 勾项目 → 开始导出，默认得到一个 **`.zip` 压缩包 + 一个 `.sha256` 小边车**（同步盘上只放两个文件），拷到新电脑。
+2. **新电脑**：设置 → 备份与迁移 → 导入 → 选包（`.zip` 可直接选）→ 填**新根目录** → 导入前体检 → 开始导入。
 
 完成后刷新页面，项目、对话、文件都在新位置，旧对话可以继续。
 
 ## 用之前先知道
 
-迁移包默认是**单个 `.zip` 压缩包 + 一个 `<包名>.zip.sha256` 传输边车**（同步盘推送/拉取只面对两个文件，降低小文件撕裂与瞬锁风险）；导出时可关掉「压缩为单文件 zip」改回文件夹形态，两种形态都能导入。包内自携带插件副本 `plugin\dsh-migrate\`，新电脑上也能从这个目录装（更推荐直接拷 `03_插件源\dsh-workspace-migrate` 的本地改造版）。
+迁移包默认是**单个 `.zip` 压缩包 + 一个 `<包名>.zip.sha256` 传输边车**（同步盘推送/拉取只面对两个文件，降低小文件撕裂与瞬锁风险）；导出时可关掉「压缩为单文件 zip」改回文件夹形态，两种形态都能导入。包内自携带插件副本 `plugin\dsh-migrate\`，新电脑上也能从这个目录装（更推荐直接从本仓库安装）。
 
 ## 能力与边界
 
@@ -48,10 +48,10 @@ dsh plugin --profile desktop add dsh-workspace-migrate
 
 ## 旧电脑：导出
 
-1. 设置 → 迁移 → **导出（旧电脑）**
+1. 设置 → 备份与迁移 → **导出（旧电脑）**
 2. 勾选要带走的工作区（默认全选），按需勾选「同时打包项目文件」「同时打包图片附件」
-3. 导出位置留空则写到 profile 配置项 `defaultOutDir`（本机默认指向同步盘 `...\DSH迁移\_transport`），未配置时回退 `~/.dsh/migrations/`
-4. 完成后把 `<包名>.zip` 与 `<包名>.zip.sha256` 两个文件拷到新电脑；先跑 L1 `migrate-govern.ps1 -Command verify`（MATCH 才导入）
+3. 导出位置留空则写到 profile 配置项 `defaultOutDir`，未配置时回退 `~/.dsh/migrations/`
+4. 完成后把 `<包名>.zip` 与 `<包名>.zip.sha256` 两个文件拷到新电脑；先校验 `.sha256` 边车与包内容一致（匹配再导入）
 
 不带项目文件时只打包对话；带项目文件时按目录排除 `node_modules`、`.git`、`.venv`、`__pycache__` 等可重建目录。
 
@@ -59,7 +59,7 @@ dsh plugin --profile desktop add dsh-workspace-migrate
 
 第一次导出之后，可以让同一个迁移包保持最新，而不是每次整包重拷：
 
-- 设置 → 迁移 → 导出 → **增量更新已有迁移包**，从列表选一个包，或直接填包的路径
+- 设置 → 备份与迁移 → 导出 → **增量更新已有迁移包**，从列表选一个包，或直接填包的路径
 - 只复制**新增或修改过**的文件；源里删掉的文件会同步从包里删除
 - 会话按其源日志的字节数与事件数判断：没变化的会话直接复用，不重新编码
 - 增量范围固定为这个包原本包含的工作区，不会把别的项目卷进来
@@ -71,7 +71,7 @@ dsh plugin --profile desktop add dsh-workspace-migrate
 ## 新电脑：导入
 
 1. 装好 DSH，从迁移包的 `plugin/dsh-migrate/` 安装本插件
-2. 设置 → 迁移 → **导入（新电脑）**
+2. 设置 → 备份与迁移 → **导入（新电脑）**
 3. 选择迁移包，读取清单
 4. 填**导入到（新根目录）**，比如 `E:\DSH`：每个项目会自动建在 `E:\DSH\<项目名>` 下，目录不存在就创建；下面每一行仍可单独改路径
 5. 勾选**重写对话里提到的旧路径**（默认开）
@@ -81,7 +81,7 @@ dsh plugin --profile desktop add dsh-workspace-migrate
 
 会话历史里的工具调用、文件引用、报错信息都写着旧机器的绝对路径（`D:\...`）。只改工作目录不改这些，续聊时模型会去找不存在的文件——这就是「对话变乱」的根因。导入时会把被重映射的根路径在事件数据里整体替换成新路径，并报告替换了多少处。
 
-实测：把 `D:\Deepseek Workspace migration` 迁到 `D:\...\_rt\root\Deepseek Workspace migration` → 报告 `rewritten=1054`，导出后检查会话内容确认工具调用、`cwd`、文件引用都指向新根。
+实测：把旧根目录迁到另一盘符下的新根目录 → 报告 `rewritten=1054`，导出后检查会话内容确认工具调用、`cwd`、文件引用都指向新根。
 
 导入通过 Harness 的公开服务（`sessionPersistence` / `workspaceRegistry`）重建，不是覆盖文件，所以：
 

@@ -9,7 +9,7 @@ window.__ModuleLoader__.load({
     const API = '/api/dsh-migrate'
 
     const ZH = {
-      title: '迁移到另一台电脑',
+      title: '备份与迁移',
       subtitle: '把工作区、项目成果和对话内容打包带走，在新电脑上还原。导出在旧电脑做，导入在新电脑做。',
       tabExport: '导出（旧电脑）',
       tabImport: '导入（新电脑）',
@@ -64,7 +64,18 @@ window.__ModuleLoader__.load({
       unchanged: '未变',
       removed: '已删除',
       importRoot: '导入到（新根目录）',
-      importRootHint: '每个项目会自动建一个以项目名命名的子文件夹；下面每一行仍可单独改。必填其一：新根或逐项映射。',
+      importRootHint: '每个项目会自动建一个以项目名命名的子文件夹；下面每一行仍可单独改。必填其一：新根或逐项映射。默认沿用上次填写的地址。',
+      chooseBundle: '选择迁移包…',
+      bundleNotChosen: '未选择迁移包',
+      bundleHint: '点「选择迁移包」从文件对话框选 .zip，或选文件夹形态的迁移包；需要时也可手动填写路径。',
+      bundleDialogHint: '选 .zip 会先拷到本机（不写同步盘）再读取；文件夹形态用「选择文件夹」。',
+      chooseZip: '选择 .zip 文件…',
+      chooseFolder: '选择文件夹…',
+      chooseRoot: '选择目录…',
+      manualPath: '手动填写路径',
+      manualPathHide: '收起手动填写',
+      uploading: '正在拷贝迁移包…',
+      cancel: '取消',
       rewritePaths: '重写对话里提到的旧路径',
       rewritePathsHint: '工具调用与结果中的旧绝对路径会换成新路径，续聊时模型才找得到文件。',
       rewrittenPaths: '重写路径',
@@ -84,7 +95,7 @@ window.__ModuleLoader__.load({
       close: '关闭',
     }
     const EN = {
-      title: 'Migrate to another computer',
+      title: 'Backup and Migration',
       subtitle: 'Package workspaces, project files, and conversations, then restore them on the new machine. Export on the old computer, import on the new one.',
       tabExport: 'Export (old computer)',
       tabImport: 'Import (new computer)',
@@ -139,7 +150,18 @@ window.__ModuleLoader__.load({
       unchanged: 'unchanged',
       removed: 'removed',
       importRoot: 'Import into (new root)',
-      importRootHint: 'Each project gets a subfolder named after it; every row below can still be edited. Required: a root or a target per row.',
+      importRootHint: 'Each project gets a subfolder named after it; every row below can still be edited. Required: a root or a target per row. The last used address is remembered.',
+      chooseBundle: 'Choose bundle…',
+      bundleNotChosen: 'No bundle selected',
+      bundleHint: 'Choose a .zip through the file dialog, pick a folder bundle, or type a path manually.',
+      bundleDialogHint: 'A chosen .zip is copied to this machine first (never the sync drive), then read. Folder bundles use “Choose folder”.',
+      chooseZip: 'Choose .zip file…',
+      chooseFolder: 'Choose folder…',
+      chooseRoot: 'Choose folder…',
+      manualPath: 'Type a path manually',
+      manualPathHide: 'Hide manual input',
+      uploading: 'Copying bundle…',
+      cancel: 'Cancel',
       rewritePaths: 'Rewrite old paths mentioned in conversations',
       rewritePathsHint: 'Absolute paths inside tool calls and results are replaced with the new ones, so a resumed conversation finds its files.',
       rewrittenPaths: 'paths rewritten',
@@ -221,6 +243,26 @@ window.__ModuleLoader__.load({
       kv: { display: 'flex', gap: 8, fontSize: 12, color: 'var(--dsw-alias-label-secondary)' },
       kvKey: { minWidth: 72, color: 'var(--dsw-alias-label-secondary)' },
       kvVal: { color: 'var(--dsw-alias-label-primary)', wordBreak: 'break-all' },
+      overlay: {
+        position: 'fixed', inset: 0, zIndex: 60, padding: 20, background: 'rgba(0, 0, 0, .42)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+      },
+      modal: {
+        width: 'min(520px, 100%)', maxHeight: 'min(70vh, 620px)', overflowY: 'auto',
+        display: 'flex', flexDirection: 'column', gap: 12,
+        border: '1px solid var(--dsw-alias-border-l1)', background: 'var(--dsw-alias-bg-layer-1)',
+        borderRadius: 12, padding: '18px 20px', boxShadow: '0 18px 48px rgba(0, 0, 0, .28)',
+      },
+      linkButton: {
+        appearance: 'none', alignSelf: 'flex-start', border: 'none', background: 'transparent',
+        color: 'var(--dsw-alias-label-secondary)', fontSize: 12, cursor: 'pointer', padding: 0,
+      },
+      modalButton: {
+        appearance: 'none', border: '1px solid var(--dsw-alias-border-l1)', borderRadius: 8,
+        background: 'var(--dsw-alias-bg-base)', color: 'var(--dsw-alias-label-primary)',
+        padding: '8px 12px', fontSize: 12.5, cursor: 'pointer', textAlign: 'left',
+        overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+      },
     }
 
     function fmtBytes(n) {
@@ -409,7 +451,7 @@ window.__ModuleLoader__.load({
     }
 
     function ExportPane(props) {
-      const { t, inventory, reload } = props
+      const { t, inventory, reload, ctx } = props
       const [selected, setSelected] = useState(null)
       const [includeFiles, setIncludeFiles] = useState(true)
       const [includeAttachments, setIncludeAttachments] = useState(true)
@@ -426,6 +468,18 @@ window.__ModuleLoader__.load({
       useEffect(() => {
         if (!updateTarget && bundles.length > 0) setUpdateTarget(bundles[0].path)
       }, [bundles, updateTarget])
+
+      const chooseOutDir = async () => {
+        try {
+          const result = await ctx.remote.directoryPicker.pick()
+          if (!result || !result.ok) {
+            throw new Error(result && result.error && result.error.message ? result.error.message : 'directory picker failed')
+          }
+          if (result.value) setOutDir(result.value)
+        } catch (error) {
+          setCleanupNote(error instanceof Error ? error.message : String(error))
+        }
+      }
 
       const toggle = (id) => {
         const next = new Set(active)
@@ -498,13 +552,18 @@ window.__ModuleLoader__.load({
           h('div', { style: C.hint }, t('packHint')),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 5 } },
             h('div', { style: C.hint }, t('outDir')),
-            h('input', {
-              style: C.input,
-              value: outDir,
-              placeholder: inventory ? inventory.migrationsDir : '',
-              onChange: (event) => setOutDir(event.target.value),
-              spellCheck: false,
-            }),
+            h(
+              'div',
+              { style: { display: 'flex', gap: 8 } },
+              h('input', {
+                style: C.input,
+                value: outDir,
+                placeholder: inventory ? inventory.migrationsDir : '',
+                onChange: (event) => setOutDir(event.target.value),
+                spellCheck: false,
+              }),
+              h('button', { style: C.button, onClick: chooseOutDir }, t('chooseRoot')),
+            ),
             h('div', { style: C.hint }, t('outDirHint')),
           ),
           h(
@@ -596,7 +655,7 @@ window.__ModuleLoader__.load({
     }
 
     function ImportPane(props) {
-      const { t, inventory, reload } = props
+      const { t, inventory, reload, ctx } = props
       const bundles = inventory ? inventory.bundles : []
       const [bundlePath, setBundlePath] = useState('')
       const [preview, setPreview] = useState(null)
@@ -610,8 +669,26 @@ window.__ModuleLoader__.load({
       const [checking, setChecking] = useState(false)
       const [loadError, setLoadError] = useState(null)
       const [undoNote, setUndoNote] = useState(null)
+      const [bundleDialog, setBundleDialog] = useState(false)
+      const [manualPath, setManualPath] = useState(false)
+      const [uploading, setUploading] = useState(false)
+      const fileInput = useRef(null)
+      const prefsApplied = useRef(false)
       const { task, run } = usePolling(t)
       const running = task && task.phase === 'running'
+
+      const pickDirectory = async () => {
+        try {
+          const result = await ctx.remote.directoryPicker.pick()
+          if (!result || !result.ok) {
+            throw new Error(result && result.error && result.error.message ? result.error.message : 'directory picker failed')
+          }
+          return result.value || null
+        } catch (error) {
+          setLoadError(error instanceof Error ? error.message : String(error))
+          return null
+        }
+      }
 
       const undo = async (result) => {
         if (!window.confirm(t('undoConfirm'))) return
@@ -631,31 +708,42 @@ window.__ModuleLoader__.load({
       }
 
       useEffect(() => {
-        if (!bundlePath && bundles.length > 0) setBundlePath(bundles[0].path)
-      }, [bundles, bundlePath])
+        if (prefsApplied.current || !inventory) return
+        prefsApplied.current = true
+        const remembered = inventory.prefs || {}
+        // Remembered values are the operator's own earlier choices, never data
+        // read from a bundle — SEC-02's explicit-target rule still holds.
+        if (remembered.lastImportRootDir) setRootDir(remembered.lastImportRootDir)
+        if (remembered.lastBundlePath) setBundlePath(remembered.lastBundlePath)
+        else if (bundles.length > 0) setBundlePath(bundles[0].path)
+      }, [inventory, bundles])
 
       const posixTarget = Boolean(
         preview && (preview.workspaces || []).some((workspace) => String(workspace.path || '').startsWith('/')),
       )
       const targetSeparator = posixTarget ? '/' : '\\'
 
-      const applyRoot = (value) => {
-        setRootDir(value)
-        if (!preview) return
-        const trimmed = value.trim()
+      /** Derive every per-project target from one operator-chosen root. */
+      const deriveRemap = (value, snapshot) => {
+        const trimmed = String(value || '').trim().replace(/[\\/]+$/, '')
         // Follow the separator style of what was typed, then of the bundle:
         // a POSIX bundle imported on Linux must never grow backslashes.
         const separator =
           trimmed.startsWith('/') || (trimmed.includes('/') && !trimmed.includes('\\')) ? '/' : targetSeparator
-        const base = trimmed.replace(/[\\/]+$/, '')
-        const next = { ...remap }
-        for (const workspace of preview.workspaces || []) {
+        const next = {}
+        for (const workspace of (snapshot && snapshot.workspaces) || []) {
           const name = String(workspace.title || workspace.path)
             .replace(/[\\/:*?"<>|]/g, ' ')
             .trim()
-          next[workspace.path] = base ? `${base}${separator}${name}` : ''
+          next[workspace.path] = trimmed ? `${trimmed}${separator}${name}` : ''
         }
-        setRemap(next)
+        return next
+      }
+
+      const applyRoot = (value) => {
+        setRootDir(value)
+        if (!preview) return
+        setRemap(deriveRemap(value, preview))
       }
 
       const runCheck = async () => {
@@ -680,14 +768,40 @@ window.__ModuleLoader__.load({
           setPreview(value)
           // Never pre-fill a bundle-recorded path as the import target. The
           // F2/SEC-02 guard only works when writing to the original path is an
-          // explicit operator decision; pre-filling here made the zero-click
-          // default exactly what the guard refuses (a bundle choosing its own
-          // destination). The row keeps a placeholder showing the old path.
-          const next = {}
-          for (const workspace of value.workspaces || []) next[workspace.path] = ''
-          setRemap(next)
+          // explicit operator decision; a remembered root the operator chose
+          // (or typed/picked now) is that decision, the bundle's own path never.
+          setRemap(deriveRemap(rootDir, value))
         } catch (error) {
           setLoadError(error instanceof Error ? error.message : String(error))
+        }
+      }
+
+      const uploadBundle = async (file) => {
+        setUploading(true)
+        setLoadError(null)
+        try {
+          const response = await fetch(`${API}/bundle-upload`, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/octet-stream',
+              'x-bundle-name': encodeURIComponent(file.name),
+            },
+            body: file,
+          })
+          let payload = null
+          try {
+            payload = await response.json()
+          } catch {
+            payload = null
+          }
+          if (!response.ok) throw new Error((payload && payload.error) || `HTTP ${response.status}`)
+          setBundleDialog(false)
+          setBundlePath(payload.path)
+          await load(payload.path)
+        } catch (error) {
+          setLoadError(error instanceof Error ? error.message : String(error))
+        } finally {
+          setUploading(false)
         }
       }
 
@@ -698,35 +812,37 @@ window.__ModuleLoader__.load({
           'div',
           { style: C.card },
           h('div', { style: C.cardTitle }, t('bundlePath')),
-          bundles.length > 0
-            ? h(
-                'div',
-                { style: { display: 'flex', gap: 8, alignItems: 'center' } },
-                h(
-                  'select',
-                  {
-                    style: { ...C.input, flex: 1 },
-                    value: bundlePath,
-                    onChange: (event) => setBundlePath(event.target.value),
-                  },
-                  ...bundles.map((bundle) =>
-                    h('option', { key: bundle.path, value: bundle.path },
-                      `${bundle.name} · ${bundle.sessions} ${t('sessions')} · ${fmtBytes(bundle.bytes || 0)}`),
-                  ),
-                ),
-                h('button', { style: C.button, onClick: () => load(bundlePath) }, t('loadPreview')),
-              )
-            : h('div', { style: C.hint }, t('noBundles')),
-          h('div', { style: { display: 'flex', gap: 8 } },
-            h('input', {
-              style: C.input,
-              value: bundlePath,
-              placeholder: 'D:\\path\\to\\dsh-migration-…',
-              onChange: (event) => setBundlePath(event.target.value),
-              spellCheck: false,
-            }),
-            h('button', { style: C.button, onClick: () => bundlePath && load(bundlePath) }, t('loadPreview')),
+          h(
+            'div',
+            { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
+            h('span', { style: { ...C.mono, flex: 1, minWidth: 180 } }, bundlePath || t('bundleNotChosen')),
+            h(
+              'button',
+              {
+                style: uploading ? { ...C.button, ...C.primaryOff } : C.button,
+                disabled: uploading,
+                onClick: () => setBundleDialog(true),
+              },
+              uploading ? t('uploading') : t('chooseBundle'),
+            ),
+            h(
+              'button',
+              { style: C.button, disabled: !bundlePath || uploading, onClick: () => bundlePath && load(bundlePath) },
+              t('loadPreview'),
+            ),
           ),
+          h('div', { style: C.hint }, t('bundleHint')),
+          bundles.length === 0 ? h('div', { style: C.hint }, t('noBundles')) : null,
+          h('button', { style: C.linkButton, onClick: () => setManualPath(!manualPath) }, manualPath ? t('manualPathHide') : t('manualPath')),
+          manualPath
+            ? h('input', {
+                style: C.input,
+                value: bundlePath,
+                placeholder: 'D:\\path\\to\\dsh-migration-…',
+                onChange: (event) => setBundlePath(event.target.value),
+                spellCheck: false,
+              })
+            : null,
           h(
             'div',
             { style: { display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' } },
@@ -781,13 +897,28 @@ window.__ModuleLoader__.load({
                 'div',
                 { style: { display: 'flex', flexDirection: 'column', gap: 5, padding: '4px 0 10px' } },
                 h('div', { style: C.cardTitle }, t('importRoot')),
-                h('input', {
-                  style: C.input,
-                  value: rootDir,
-                  placeholder: posixTarget ? '/home/<user>/dsh' : 'E:\\DSH',
-                  onChange: (event) => applyRoot(event.target.value),
-                  spellCheck: false,
-                }),
+                h(
+                  'div',
+                  { style: { display: 'flex', gap: 8 } },
+                  h('input', {
+                    style: C.input,
+                    value: rootDir,
+                    placeholder: posixTarget ? '/home/<user>/dsh' : 'E:\\DSH',
+                    onChange: (event) => applyRoot(event.target.value),
+                    spellCheck: false,
+                  }),
+                  h(
+                    'button',
+                    {
+                      style: C.button,
+                      onClick: async () => {
+                        const dir = await pickDirectory()
+                        if (dir) applyRoot(dir)
+                      },
+                    },
+                    t('chooseRoot'),
+                  ),
+                ),
                 h('div', { style: C.hint }, t('importRootHint')),
               ),
               ...(preview.workspaces || []).map((workspace) =>
@@ -801,13 +932,28 @@ window.__ModuleLoader__.load({
                     h('span', { style: C.badge }, `${workspace.sessions} ${t('sessionCount')} · ${fmtBytes(workspace.bytes || 0)}`),
                   ),
                   h('div', { style: C.mono }, `${t('from')}: ${workspace.path}`),
-                  h('input', {
-                    style: C.input,
-                    value: remap[workspace.path] ?? '',
-                    placeholder: workspace.path,
-                    onChange: (event) => setRemap({ ...remap, [workspace.path]: event.target.value }),
-                    spellCheck: false,
-                  }),
+                  h(
+                    'div',
+                    { style: { display: 'flex', gap: 8 } },
+                    h('input', {
+                      style: C.input,
+                      value: remap[workspace.path] ?? '',
+                      placeholder: workspace.path,
+                      onChange: (event) => setRemap({ ...remap, [workspace.path]: event.target.value }),
+                      spellCheck: false,
+                    }),
+                    h(
+                      'button',
+                      {
+                        style: C.button,
+                        onClick: async () => {
+                          const dir = await pickDirectory()
+                          if (dir) setRemap({ ...remap, [workspace.path]: dir })
+                        },
+                      },
+                      t('chooseRoot'),
+                    ),
+                  ),
                 ),
               ),
             )
@@ -859,11 +1005,102 @@ window.__ModuleLoader__.load({
                 : null,
             )
           : null,
+        bundleDialog
+          ? h(
+              'div',
+              {
+                style: C.overlay,
+                onClick: (event) => {
+                  if (event.target === event.currentTarget) setBundleDialog(false)
+                },
+              },
+              h(
+                'div',
+                { style: C.modal },
+                h('div', { style: C.cardTitle }, t('chooseBundle')),
+                h('div', { style: C.hint }, t('bundleDialogHint')),
+                h(
+                  'div',
+                  { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+                  h(
+                    'button',
+                    {
+                      style: C.button,
+                      disabled: uploading,
+                      onClick: () => {
+                        setBundleDialog(false)
+                        if (fileInput.current) fileInput.current.click()
+                      },
+                    },
+                    t('chooseZip'),
+                  ),
+                  h(
+                    'button',
+                    {
+                      style: C.button,
+                      onClick: async () => {
+                        const dir = await pickDirectory()
+                        if (dir) {
+                          setBundleDialog(false)
+                          setBundlePath(dir)
+                          await load(dir)
+                        }
+                      },
+                    },
+                    t('chooseFolder'),
+                  ),
+                  bundles.length > 0
+                    ? h(
+                        'div',
+                        {
+                          style: {
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: 6,
+                            borderTop: '1px solid var(--dsw-alias-border-l1)',
+                            paddingTop: 10,
+                          },
+                        },
+                        h('div', { style: C.hint }, t('recent')),
+                        ...bundles.slice(0, 8).map((bundle) =>
+                          h(
+                            'button',
+                            {
+                              key: bundle.path,
+                              style: { ...C.modalButton, fontFamily: 'ui-monospace, monospace', fontSize: 11.5 },
+                              onClick: () => {
+                                setBundleDialog(false)
+                                setBundlePath(bundle.path)
+                                load(bundle.path)
+                              },
+                            },
+                            `${bundle.name} · ${bundle.sessions} ${t('sessions')}`,
+                          ),
+                        ),
+                      )
+                    : null,
+                ),
+                h('button', { style: C.button, onClick: () => setBundleDialog(false) }, t('cancel')),
+              ),
+            )
+          : null,
+        h('input', {
+          ref: fileInput,
+          type: 'file',
+          accept: '.zip,application/zip,application/x-zip-compressed',
+          style: { display: 'none' },
+          onChange: (event) => {
+            const file = event.target.files && event.target.files[0]
+            event.target.value = ''
+            if (file) uploadBundle(file)
+          },
+        }),
       )
     }
 
     function MigrateSection(props) {
       const t = props.t
+      const ctx = props.ctx
       const [tab, setTab] = useState('export')
       const [inventory, setInventory] = useState(null)
       const [loadError, setLoadError] = useState(null)
@@ -895,13 +1132,13 @@ window.__ModuleLoader__.load({
           h('button', { style: { ...C.tab, ...(tab === 'import' ? C.tabActive : {}) }, onClick: () => setTab('import') }, t('tabImport')),
         ),
         tab === 'export'
-          ? h(ExportPane, { t, inventory, reload: load })
-          : h(ImportPane, { t, inventory, reload: load }),
+          ? h(ExportPane, { t, inventory, reload: load, ctx })
+          : h(ImportPane, { t, inventory, reload: load, ctx }),
       )
     }
 
     return {
-      inject: ['slots', 'locale'],
+      inject: ['slots', 'locale', 'remote', 'remote.directoryPicker'],
       apply(ctx) {
         const dicts = { zh: ZH, en: EN }
         const locale = ctx.get('locale')
@@ -924,7 +1161,7 @@ window.__ModuleLoader__.load({
               () => ctx.locale.getSnapshot(),
             )
           }
-          return h(MigrateSection, { t })
+          return h(MigrateSection, { t, ctx })
         }
 
         ctx.slots.inject('settings.section', () =>

@@ -8,3 +8,6 @@ Thumbs.db
 docs/promo/
 screenshots/
 recordings/
+
+# Internal publish playbook - stays on this machine
+docs/PUBLISH.md
