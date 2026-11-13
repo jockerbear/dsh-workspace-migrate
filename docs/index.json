@@ -45,12 +45,12 @@
       },
       "versions": [
         {
-          "version": "0.6.0",
-          "publishTimestamp": 1794364779,
+          "version": "0.6.1",
+          "publishTimestamp": 1794580811,
           "source": {
             "type": "git",
             "url": "https://github.com/jockerbear/dsh-workspace-migrate",
-            "commit": "d316654d100e0ae668b6418e91672ed8cf7d288e"
+            "commit": "163b9203937cbb83f0f63e993460eca7fba475b9"
           },
           "engines": {
             "dsh": "^0.2.1-rc.2"
