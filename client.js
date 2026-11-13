@@ -24,7 +24,7 @@ window.__ModuleLoader__.load({
       pack: '压缩为单文件 zip（推荐）',
       packHint: '同步盘只放 1 个压缩包 + 1 行哈希，推送/拉取出错概率最小；导入时自动解压。取消勾选则输出文件夹形态。',
       outDir: '导出位置',
-      outDirHint: '留空则用 ~/.dsh/migrations。',
+      outDirHint: '留空则写到导出默认目录（见输入框提示）；导出后会记住本次填写，下次自动填入。',
       startExport: '开始导出',
       exportRunning: '正在导出…',
       exportDone: '导出完成',
@@ -110,7 +110,7 @@ window.__ModuleLoader__.load({
       pack: 'Pack as a single .zip (recommended)',
       packHint: 'Puts one archive plus a one-line hash on the sync drive — the smallest push/pull error surface. Import extracts it automatically. Clear to write a folder bundle instead.',
       outDir: 'Export location',
-      outDirHint: 'Empty uses ~/.dsh/migrations.',
+      outDirHint: 'Empty writes to the default export directory (shown in the field); your entry is remembered and pre-filled next time.',
       startExport: 'Start export',
       exportRunning: 'Exporting…',
       exportDone: 'Export finished',
@@ -469,6 +469,17 @@ window.__ModuleLoader__.load({
         if (!updateTarget && bundles.length > 0) setUpdateTarget(bundles[0].path)
       }, [bundles, updateTarget])
 
+      const prefsApplied = useRef(false)
+      useEffect(() => {
+        if (prefsApplied.current || !inventory) return
+        prefsApplied.current = true
+        const remembered = inventory.prefs || {}
+        // The remembered value is the operator's own earlier export choice —
+        // written only by the export route, never by a bundle — so pre-filling
+        // it is the export-side counterpart of SEC-02's operator-only rule.
+        if (remembered.lastOutDir) setOutDir(remembered.lastOutDir)
+      }, [inventory])
+
       const chooseOutDir = async () => {
         try {
           const result = await ctx.remote.directoryPicker.pick()
@@ -558,7 +569,7 @@ window.__ModuleLoader__.load({
               h('input', {
                 style: C.input,
                 value: outDir,
-                placeholder: inventory ? inventory.migrationsDir : '',
+                placeholder: inventory ? inventory.defaultOutDir || inventory.migrationsDir : '',
                 onChange: (event) => setOutDir(event.target.value),
                 spellCheck: false,
               }),

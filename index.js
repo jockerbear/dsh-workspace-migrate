@@ -367,12 +367,13 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  // ── remembered import targets (operator data, never bundle data) ──────────
+  // ── remembered operator choices (operator data, never bundle data) ────────
   // The desktop Web UI serves a fresh port on every launch, so browser storage
   // keyed by origin would be lost; remembering the last operator-chosen import
-  // root on the local disk keeps repeated imports to one pick. Only the
-  // operator writes these values, so pre-filling SEC-02's required explicit
-  // target from them never lets a bundle choose its own destination.
+  // root and export destination on the local disk keeps repeated runs to one
+  // pick. Only the operator writes these values — the browser routes, never
+  // the model tool — so pre-filling SEC-02's required explicit target from
+  // them never lets a bundle (or an agent) choose a destination.
   function prefsPath() {
     return join(dshHome(), 'migrations-prefs.json')
   }
@@ -383,9 +384,10 @@ export function apply(ctx, config = {}) {
       return {
         lastImportRootDir: typeof parsed.lastImportRootDir === 'string' ? parsed.lastImportRootDir : '',
         lastBundlePath: typeof parsed.lastBundlePath === 'string' ? parsed.lastBundlePath : '',
+        lastOutDir: typeof parsed.lastOutDir === 'string' ? parsed.lastOutDir : '',
       }
     } catch {
-      return { lastImportRootDir: '', lastBundlePath: '' }
+      return { lastImportRootDir: '', lastBundlePath: '', lastOutDir: '' }
     }
   }
 
@@ -401,6 +403,13 @@ export function apply(ctx, config = {}) {
           typeof patch.lastBundlePath === 'string' && patch.lastBundlePath.trim()
             ? patch.lastBundlePath.trim()
             : current.lastBundlePath,
+        // Unlike the import fields, an explicit empty string is meaningful for
+        // lastOutDir: a blank export box means "follow config.defaultOutDir",
+        // and remembering that choice must be able to clear a stale path.
+        // The raw box value is stored (not the resolved path) so a later
+        // config change still applies when the box stays blank.
+        lastOutDir:
+          typeof patch.lastOutDir === 'string' ? patch.lastOutDir.trim() : current.lastOutDir,
       }
       await retryFs(() => fsp.writeFile(prefsPath(), JSON.stringify(next, null, 2), 'utf8'), 'prefs')
     } catch {
@@ -603,8 +612,12 @@ export function apply(ctx, config = {}) {
     return {
       home,
       migrationsDir: join(home, 'migrations'),
+      // Effective default for an empty export box: config.defaultOutDir when
+      // set, else ~/.dsh/migrations — lets the UI placeholder show where a
+      // blank field actually writes instead of always claiming migrations/.
+      defaultOutDir: defaultOutDir ?? join(home, 'migrations'),
       prefs: await readPrefs(),
-      codeVersion: 10,
+      codeVersion: 11,
       workspaces,
       sessions,
       archived: sets.archived,
@@ -2072,6 +2085,14 @@ export function apply(ctx, config = {}) {
       }
       if (req.method === 'POST' && route === '/export') {
         const body = await readJson(req)
+        // Remember the operator's export destination (raw box value; empty
+        // clears it back to "follow config.defaultOutDir") so the next visit
+        // opens pre-filled. Only this browser route writes it — the model
+        // tool never does — and update/dry-run exports write nothing new,
+        // so neither may move the pointer.
+        if (body && body.mode !== 'update' && body.dryRun !== true) {
+          await savePrefs({ lastOutDir: typeof body.outDir === 'string' ? body.outDir : '' })
+        }
         const task = startTask('export')
         runExport(task, body).then((result) => succeed(task, result)).catch((error) => fail(task, error))
         sendJson(res, 200, { taskId: task.id })

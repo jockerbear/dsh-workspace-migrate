@@ -18,7 +18,7 @@
 
 ```bash
 # 桌面端（推荐：Release 预构建包）
-dsh plugin --profile desktop add "https://github.com/jockerbear/dsh-workspace-migrate/releases/download/v0.6.0/dsh-workspace-migrate-0.6.0.tgz"
+dsh plugin --profile desktop add "https://github.com/jockerbear/dsh-workspace-migrate/releases/download/v0.6.1/dsh-workspace-migrate-0.6.1.tgz"
 
 # 或从仓库源码装
 dsh plugin --profile desktop add github:jockerbear/dsh-workspace-migrate
@@ -55,7 +55,7 @@ dsh plugin --profile desktop add github:jockerbear/dsh-workspace-migrate
 
 1. 设置 → 备份与迁移 → **导出（旧电脑）**
 2. 勾选要带走的工作区（默认全选），按需勾选「同时打包项目文件」「同时打包图片附件」
-3. 导出位置留空则写到 profile 配置项 `defaultOutDir`，未配置时回退 `~/.dsh/migrations/`
+3. 导出位置留空则写到 profile 配置项 `defaultOutDir`，未配置时回退 `~/.dsh/migrations/`（输入框会显示实际生效的默认目录）；填过的值会记住，下次打开自动填入
 4. 完成后把 `<包名>.zip` 与 `<包名>.zip.sha256` 两个文件拷到新电脑；先校验 `.sha256` 边车与包内容一致（匹配再导入）
 
 不带项目文件时只打包对话；带项目文件时按目录排除 `node_modules`、`.git`、`.venv`、`__pycache__` 等可重建目录。
