@@ -17,9 +17,14 @@
 ## 安装
 
 ```bash
-# 桌面端（大多数情况）
-dsh plugin --profile desktop add dsh-workspace-migrate
+# 桌面端（推荐：Release 预构建包）
+dsh plugin --profile desktop add "https://github.com/jockerbear/dsh-workspace-migrate/releases/download/v0.6.0/dsh-workspace-migrate-0.6.0.tgz"
+
+# 或从仓库源码装
+dsh plugin --profile desktop add github:jockerbear/dsh-workspace-migrate
 ```
+
+⚠️ **不要用裸包名 `dsh-workspace-migrate`**：npm 上的同名包是上游 0.5.4（lij0000-arch），不是本仓库。
 
 不想用命令行：设置 → 插件 里安装，或在一个对话里让 agent 用 `plugin_manager` 装这个仓库。装完刷新页面，**设置 → 备份与迁移** 出现即可用。
 
