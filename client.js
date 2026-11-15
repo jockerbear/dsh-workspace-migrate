@@ -50,7 +50,13 @@ window.__ModuleLoader__.load({
       report: '结果',
       imported: '已导入会话',
       skipped: '跳过',
-      flattened: '展开的 fork 会话',
+      updated: '增量更新',
+      eventsAppended: '追加事件',
+      upToDate: '已最新',
+      mergeExisting: '增量更新已存在的会话（仅快进合并）',
+      mergeExistingHint: '同一个会话在旧电脑上继续聊过：本机只停在旧内容时追加新事件；两端都继续过则跳过，绝不覆盖本机。追加无法用「撤销这次导入」回退。',
+      mergeNotUndoable: '增量追加的事件无法撤销',
+      seeded: '保留继承前缀的 fork 会话',
       warnings: '提醒',
       undo: '撤销这次导入',
       undoConfirm: '将删除本次导入创建的项目登记和会话文件，确定吗？',
@@ -136,7 +142,13 @@ window.__ModuleLoader__.load({
       report: 'Result',
       imported: 'Sessions imported',
       skipped: 'Skipped',
-      flattened: 'Flattened forks',
+      updated: 'sessions updated',
+      eventsAppended: 'events appended',
+      upToDate: 'up to date',
+      mergeExisting: 'Update existing sessions (fast-forward only)',
+      mergeExistingHint: 'When the same session was resumed on the old computer, its new events are appended as long as this machine still holds the older prefix. If both sides were resumed, it is skipped instead of overwritten. Appended events cannot be undone.',
+      mergeNotUndoable: 'Appended events cannot be undone',
+      seeded: 'Seeded forks preserved',
       warnings: 'Notes',
       undo: 'Undo this import',
       undoConfirm: 'This deletes the workspace registrations and session files created by this import. Continue?',
@@ -360,6 +372,9 @@ window.__ModuleLoader__.load({
                 `${t('reused')} ${result.sessionsReused} · ${t('copied')} ${result.filesCopied} (${fmtBytes(result.bytesCopied)}) · ${t('unchanged')} ${result.filesUnchanged} · ${t('removed')} ${result.filesRemoved}`,
               )
             : null,
+          result.mode === 'update' && result.sessionsUpdated > 0
+            ? h('div', { style: C.hint }, `${t('updated')} ${result.sessionsUpdated} · ${t('eventsAppended')} ${result.eventsAdded}`)
+            : null,
           h('div', { style: C.mono }, result.path),
           (result.warnings || []).length > 0
             ? h(
@@ -374,7 +389,12 @@ window.__ModuleLoader__.load({
         'div',
         { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
         h('div', { style: C.ok }, `${t('importDone')} · ${t('imported')} ${result.sessionsImported} · ${t('skipped')} ${result.sessionsSkipped.length}`),
-        result.flattened > 0 ? h('div', { style: C.hint }, `${t('flattened')}: ${result.flattened}`) : null,
+        result.sessionsUpdated > 0
+          ? h('div', { style: C.ok }, `${t('updated')} ${result.sessionsUpdated} · ${t('eventsAppended')} ${result.eventsAppended}`)
+          : null,
+        result.sessionsUpToDate > 0 ? h('div', { style: C.hint }, `${t('upToDate')}: ${result.sessionsUpToDate}`) : null,
+        result.sessionsUpdated > 0 ? h('div', { style: C.hint }, t('mergeNotUndoable')) : null,
+        result.seeded > 0 ? h('div', { style: C.hint }, `${t('seeded')}: ${result.seeded}`) : null,
         result.rewritten > 0 ? h('div', { style: C.hint }, `${t('rewrittenPaths')}: ${result.rewritten}`) : null,
         result.missingAttachments > 0
           ? h('div', { style: C.warn }, `${t('missingAttachments')}: ${result.missingAttachments}`)
@@ -676,6 +696,7 @@ window.__ModuleLoader__.load({
       const [overwriteFiles, setOverwriteFiles] = useState(false)
       const [rootDir, setRootDir] = useState('')
       const [rewritePaths, setRewritePaths] = useState(true)
+      const [mergeExisting, setMergeExisting] = useState(true)
       const [check, setCheck] = useState(null)
       const [checking, setChecking] = useState(false)
       const [loadError, setLoadError] = useState(null)
@@ -980,6 +1001,8 @@ window.__ModuleLoader__.load({
               h('label', { style: C.label }, h(Checkbox, { checked: overwriteFiles, onChange: setOverwriteFiles }), t('overwrite')),
               h('label', { style: C.label }, h(Checkbox, { checked: rewritePaths, onChange: setRewritePaths }), t('rewritePaths')),
               h('div', { style: C.hint }, t('rewritePathsHint')),
+              h('label', { style: C.label }, h(Checkbox, { checked: mergeExisting, onChange: setMergeExisting }), t('mergeExisting')),
+              h('div', { style: C.hint }, t('mergeExistingHint')),
               h(
                 'button',
                 {
@@ -990,6 +1013,7 @@ window.__ModuleLoader__.load({
                     remap,
                     rootDir: rootDir.trim() || null,
                     rewritePaths,
+                    mergeExisting,
                     includeFiles,
                     includeAttachments,
                     overwriteFiles,

@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Syntax check
+        run: |
+          node --check index.js
+          node --check client.js
+          node --check zipfs.js
+      - name: Manifest and version single-point
+        run: |
+          node -e "const fs=require('fs');const p=require('./package.json');const d=JSON.parse(fs.readFileSync('docs/index.json','utf8'));const entry=d.plugins.find(x=>x.name===p.name);const v=entry&&entry.versions[0]&&entry.versions[0].version;if(p.private!==false) throw new Error('package must be publishable');if(p.version!==v) throw new Error('version mismatch: package '+p.version+' vs index '+v);if(!(p.dsh&&p.dsh.bundle&&p.dsh.bundle.patch)) throw new Error('missing dsh.bundle.patch');console.log('manifest ok',p.version)"
+      - name: Bundle patch present
+        run: test -f cordis.patch.yml

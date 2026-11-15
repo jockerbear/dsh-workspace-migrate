@@ -1,0 +1,3 @@
+# Keep every file byte-faithful: no CRLF conversion on checkout/commit.
+# The plugin is plain ESM/JS; mixed line endings only create noisy diffs.
+* -text

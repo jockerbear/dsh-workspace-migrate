@@ -12,13 +12,13 @@
 
 - **按工作区选**，不是整机全量：勾哪个项目就带走哪个项目的会话、归属、置顶/归档、文件和附件。
 - **指定新根目录**：导入时填一个目录，每个项目自动建 `<根>/<项目名>`，并把历史对话里的旧绝对路径**重写**成新路径——这是「搬过去就能接着聊」的关键。
-- **增量同步**：之后想再同步一次，只复制改动的文件，没变化的会话直接复用。
+- **增量同步**：之后想再同步一次，只复制改动的文件，没变化的会话直接复用；旧机器上重新激活（继续聊）的会话再次导入时会**快进追加**新事件，不再整条跳过。
 
 ## 安装
 
 ```bash
 # 桌面端（推荐：Release 预构建包）
-dsh plugin --profile desktop add "https://github.com/jockerbear/dsh-workspace-migrate/releases/download/v0.6.1/dsh-workspace-migrate-0.6.1.tgz"
+dsh plugin --profile desktop add "https://github.com/jockerbear/dsh-workspace-migrate/releases/download/v0.7.0/dsh-workspace-migrate-0.7.0.tgz"
 
 # 或从仓库源码装
 dsh plugin --profile desktop add github:jockerbear/dsh-workspace-migrate
@@ -73,6 +73,20 @@ dsh plugin --profile desktop add github:jockerbear/dsh-workspace-migrate
 
 判断变更用「文件大小 + 修改时间」：内容变了但大小和时间都没变的文件不会被识别（正常编辑不会出现）。
 
+## 再次导入：重新激活的会话会增量更新（0.7.0+）
+
+历史会话在新旧两台机器上都存在时，导入不再一律跳过：
+
+- **快进合并**：本机保存的会话是包内会话的严格前缀（同一条时间线，只是更短）→ 只把包内多出来的尾部事件追加进来，会话 id、标题、归属不变
+- **已最新**：本机事件数与包内相同 → 直接跳过，不重复写
+- **分叉跳过**：本机也在这条会话里继续聊过（两边都新增了事件）→ 跳过并在报告里写明「两端已分叉」，本机内容一字不动
+- **占用跳过**：会话正在界面里使用（写入占用）→ 跳过，关掉会话后重导即可
+- **fork 会话**：按 DSH 原生结构（继承前缀 + `session/end-seed` 标记）导入，之后同样支持快进追加
+
+判断「同一条时间线」用 `header.createdAt` 与事件的 `seq/type/time`，不受导入时路径重写影响；因此换一个新根目录再导一次也不会误判。追加前做两层校验：事件类型必属本机 DSH 已知词汇（或带 `ignorable` 标记），并用 DSH 自己的 `Session` 构造器把「本机日志 + 尾部」试构造一次（不落库、不 announce），畸形载荷会被拒绝，避免把已有会话追加成读不出来的状态。追加的事件走公开的 `sessionPersistence` 写入通道，遵守 DSH 的单写者与连续 seq 约束。
+
+报告会给出「增量更新 N · 追加 M 事件 · 已最新 K」；**追加的事件无法用「撤销这次导入」回退**（撤销只删本次新建的会话/项目）。需要严格回退时，请在导入前备份 `~/.dsh/sessions`。
+
 ## 新电脑：导入
 
 1. 装好 DSH，从迁移包的 `plugin/dsh-migrate/` 安装本插件
@@ -90,8 +104,8 @@ dsh plugin --profile desktop add github:jockerbear/dsh-workspace-migrate
 
 导入通过 Harness 的公开服务（`sessionPersistence` / `workspaceRegistry`）重建，不是覆盖文件，所以：
 
-- 已有同名会话会跳过，不会覆盖
-- fork 出来的会话会把父会话前缀展开成独立会话
+- 同 id 会话默认按「快进合并」处理（见上一节）：本机是旧前缀就追加，已最新或分叉则跳过，绝不覆盖本机
+- fork 出来的会话按 DSH 原生 seeded 结构导入（继承前缀 + 标记），不再展开复制
 - 归档/置顶状态会尽量恢复
 - 导入错了可以用「撤销这次导入」按本次报告里的 id 回滚
 - 报告里的「未归属项目的会话」表示该会话的 cwd 不落在任何项目目录，检查一下路径映射即可

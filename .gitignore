@@ -4,6 +4,10 @@ dist/
 .DS_Store
 Thumbs.db
 
+# Sync-client conflict copies are evidence; they stay on this machine, never in git
+*冲突文件*
+*_conflict_*
+
 # Promo material stays on this machine - see AGENTS.md in the workspace root
 docs/promo/
 screenshots/

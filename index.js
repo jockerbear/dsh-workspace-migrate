@@ -617,7 +617,7 @@ export function apply(ctx, config = {}) {
       // blank field actually writes instead of always claiming migrations/.
       defaultOutDir: defaultOutDir ?? join(home, 'migrations'),
       prefs: await readPrefs(),
-      codeVersion: 11,
+      codeVersion: 12,
       workspaces,
       sessions,
       archived: sets.archived,
@@ -1092,6 +1092,8 @@ export function apply(ctx, config = {}) {
     const sessionState = {}
     let bytes = 0
     let sessionsReused = 0
+    let sessionsUpdated = 0
+    let eventsAdded = 0
 
     const zstd = await loadZstd()
     const sessionsFailed = []
@@ -1148,6 +1150,11 @@ export function apply(ctx, config = {}) {
             events: Array.isArray(events) ? events.length : 0,
           }
           manifestSessions.push(meta)
+          const previousEvents = typeof previous?.events === 'number' ? previous.events : null
+          if (updating && previousEvents !== null && meta.events > previousEvents) {
+            sessionsUpdated += 1
+            eventsAdded += meta.events - previousEvents
+          }
           sessionState[id] = {
             meta,
             sourceBytes,
@@ -1407,6 +1414,8 @@ export function apply(ctx, config = {}) {
       sessionsSkipped: sessionsFailed,
       sessionsUnexported,
       sessionsReused,
+      sessionsUpdated,
+      eventsAdded,
       workspaces: workspaceDoc.workspaces.length,
       bytes: totalBytes,
       sessionBytes: bytes,
@@ -1631,14 +1640,281 @@ export function apply(ctx, config = {}) {
     return true
   }
 
-  function auditDocument(document) {
+  function auditEventList(events) {
     const refs = new Map()
-    for (const event of document.events ?? []) {
+    for (const event of events ?? []) {
       if (event && event.data) collectAttachments(event.data, refs)
     }
     const missingIds = []
     for (const [id, ref] of refs) if (!attachmentExists(ref)) missingIds.push(id)
     return { refs: refs.size, missing: missingIds.length, missingIds: missingIds.slice(0, 20) }
+  }
+
+  function auditDocument(document) {
+    return auditEventList(document.events ?? [])
+  }
+
+  // ── incremental re-import (0.7.0) ────────────────────────────────────────
+  // A historical session that was re-activated on the source machine keeps its
+  // id but grows. The bundle therefore carries a longer log; the destination
+  // must append the unseen tail instead of skipping the id. Only a strict
+  // prefix match is accepted (fast-forward), so a diverged local log — for
+  // example one that was resumed here too — is never overwritten, truncated or
+  // interleaved. Prefix identity uses seq/type/time: path rewriting mutates
+  // event.data only and must never make the same lineage look different.
+  function lineageKey(event) {
+    return `${event?.seq}\u0000${event?.type}\u0000${event?.time}`
+  }
+
+  function firstLineageMismatch(localEvents, bundleEvents, length) {
+    const limit = Math.min(length, localEvents.length, bundleEvents.length)
+    for (let index = 0; index < limit; index += 1) {
+      const local = localEvents[index]
+      const bundled = bundleEvents[index]
+      if (local?.seq !== index || bundled?.seq !== index) return index
+      if (lineageKey(local) !== lineageKey(bundled)) return index
+    }
+    return -1
+  }
+
+  async function readStoredSession(id) {
+    const handle = await ctx.sessionPersistence.open(id, 'read')
+    try {
+      const result = await handle.read()
+      return {
+        header: handle.header,
+        inheritedEventCount: handle.inheritedEventCount ?? 0,
+        events: Array.isArray(result.events) ? result.events : [],
+      }
+    } finally {
+      await handle.close()
+    }
+  }
+
+  function isSessionOwnedError(error) {
+    const text = `${error?.name ?? ''} ${error?.message ?? ''}`
+    return /AlreadyOwned|already owned|正在使用|被占用/i.test(text)
+  }
+
+  // Event vocabulary of the running DSH build (0.2.2-rc.3). `append` only
+  // checks the envelope and seq contiguity; the read path refuses an unknown
+  // type unless the event is marked `ignorable`, so an append could otherwise
+  // make an existing session unreadable. Unknown-but-ignorable events are the
+  // documented forward-compatibility mechanism and stay allowed.
+  const KNOWN_SESSION_EVENT_TYPES = new Set([
+    'agent-preset/selected',
+    'agent/inbox/spliced',
+    'approval/asked',
+    'approval/decided',
+    'approval/policy',
+    'assistant/attempt',
+    'assistant/message',
+    'command/done',
+    'command/run',
+    'compaction/end',
+    'compaction/prune',
+    'compaction/start',
+    'compaction/summary',
+    'deliverables/presented',
+    'developer/message',
+    'feedback/message-delete',
+    'feedback/message-put',
+    'feedback/record',
+    'goal/change',
+    'hook/invoked',
+    'hook/result',
+    'image/offload',
+    'job/registered',
+    'job/settled',
+    'llm/retry',
+    'llm/retry-started',
+    'model/selection',
+    'permission/preset',
+    'plan/mode',
+    'request/context',
+    'request/header',
+    'sandbox/mode',
+    'schedule/change',
+    'session-log-deepseek/delivery-accepted',
+    'session/end-seed',
+    'session/title',
+    'session/title-llm-request',
+    'step/end',
+    'step/start',
+    'subagent/catalog',
+    'subagent/descriptor',
+    'subagent/model-selection-policy',
+    'system/message',
+    'team/member',
+    'team/message/delivered',
+    'team/message/queued',
+    'team/mode',
+    'team/task',
+    'todo/write',
+    'tool-workflow/agent-end',
+    'tool-workflow/agent-start',
+    'tool-workflow/run-end',
+    'tool-workflow/run-start',
+    'tool/call',
+    'tool/ptc-dispatch',
+    'tool/ptc-dispatch-start',
+    'tool/result',
+    'turn/end',
+    'turn/start',
+    'user/message',
+    'web/deepseek-search-llm-request',
+    'working-directory/change',
+    'workspace/changes',
+  ])
+
+  /** Describe why a tail batch must not be appended, or null when it is safe. */
+  function invalidAppendTail(events) {
+    for (const event of events) {
+      if (!event || typeof event.type !== 'string') return '事件缺少类型'
+      if (typeof event.seq !== 'number' || typeof event.time !== 'number') return '事件信封缺少 seq/time'
+      if (!event.data || typeof event.data !== 'object' || Array.isArray(event.data)) return '事件 data 不是对象'
+      if (event.type === 'session/end-seed') return '禁止追加 fork 继承标记'
+      if (!KNOWN_SESSION_EVENT_TYPES.has(event.type) && event.ignorable !== true) return `未知事件类型 ${event.type}`
+    }
+    return null
+  }
+
+  /**
+   * Authoritative log validation: build a throwaway Session from the exact
+   * candidate log (local prefix + unseen tail) with DSH's own constructor and
+   * never enter it into the store. The read path rejects malformed payloads of
+   * K N O W N types too, so an allowlist alone cannot prove an append safe.
+   * Returns an error message, or null when the log is constructible.
+   */
+  function validateCandidateLog(local, tail) {
+    const sessions = ctx.get('sessions')
+    if (!sessions || typeof sessions.prepare !== 'function') return undefined
+    try {
+      const probeId = `session-probe-${randomUUID()}`
+      sessions.prepare(probeId, {
+        seed: [...local.events, ...tail],
+        meta: { ...local.header, id: probeId },
+        inheritedEventCount: local.inheritedEventCount ?? 0,
+        eventState: 'detached',
+      })
+      return null
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error)
+    }
+  }
+
+  /**
+   * Fast-forward one existing session. Returns an outcome instead of throwing:
+   * a merge problem is reported as a skip and never aborts the whole import.
+   * The append happens through the public write handle, so the backend keeps
+   * its single-writer and contiguous-seq guarantees. Report counters are
+   * returned to the caller and committed only after the append succeeds.
+   */
+  async function mergeStoredSession({
+    id,
+    bundleHeader,
+    bundleEvents,
+    pairs,
+    options,
+    willInstallAttachments,
+    formatMismatch,
+  }) {
+    let local
+    try {
+      local = await readStoredSession(id)
+    } catch (error) {
+      return { outcome: 'skipped', reason: `读取本机会话失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+    if (formatMismatch) {
+      return { outcome: 'skipped', reason: '迁移包日志格式与本机不一致，已跳过增量更新（建议两台机器使用同一版本 DSH）' }
+    }
+    // Same id on both machines must be the same session, not a coincidence.
+    if (local.header?.createdAt !== bundleHeader?.createdAt) {
+      return { outcome: 'conflict', reason: '同 id 会话的创建时间不一致，已拒绝增量更新' }
+    }
+    const localEvents = local.events
+    const localCount = localEvents.length
+    const bundleCount = bundleEvents.length
+    const mismatch = firstLineageMismatch(localEvents, bundleEvents, Math.min(localCount, bundleCount))
+    if (mismatch >= 0) {
+      return { outcome: 'conflict', reason: `两端已分叉（第 ${mismatch + 1} 个事件不一致），未改动本机` }
+    }
+    if (localCount === bundleCount) return { outcome: 'upToDate', total: localCount }
+    if (localCount > bundleCount) {
+      return {
+        outcome: 'localNewer',
+        reason: `本机较新（本机 ${localCount} 个事件 / 包内 ${bundleCount} 个），未改动本机`,
+      }
+    }
+    const tail = bundleEvents.slice(localCount)
+    if (tail.length === 0) return { outcome: 'upToDate', total: localCount }
+    if (tail[0]?.seq !== localCount) {
+      return { outcome: 'conflict', reason: `事件序号不连续（本机 ${localCount} 个事件，包内从 ${tail[0]?.seq} 起）` }
+    }
+    const invalid = invalidAppendTail(tail)
+    if (invalid) {
+      return { outcome: 'conflict', reason: `包内事件不可安全追加（${invalid}），未改动本机` }
+    }
+    // History in the appended tail still names the old machine's paths.
+    let rewritten = 0
+    if (options.rewritePaths !== false && pairs.length > 0) {
+      const stats = { count: 0 }
+      for (const event of tail) {
+        if (event.data && typeof event.data === 'object') event.data = rewritePaths(event.data, pairs, stats)
+      }
+      rewritten = stats.count
+    }
+    let attachmentGap = null
+    if (!willInstallAttachments) {
+      const audit = auditEventList(tail)
+      if (audit.missing > 0) attachmentGap = { missing: audit.missing, total: audit.refs }
+    }
+    // Constructing the candidate log with DSH's own Session validates every
+    // event payload (the read path is stricter than the append path), so a
+    // bundle cannot poison a readable session with a malformed known type.
+    const candidateError = validateCandidateLog(local, tail)
+    if (candidateError !== null && candidateError !== undefined) {
+      return { outcome: 'conflict', reason: `追加后无法通过 DSH 日志校验（${candidateError}），未改动本机` }
+    }
+    let writer
+    try {
+      writer = await ctx.sessionPersistence.open(id, 'write')
+    } catch (error) {
+      if (isSessionOwnedError(error)) {
+        return { outcome: 'locked', reason: '本机会话正在使用中（可能已在界面打开），已跳过增量更新' }
+      }
+      return { outcome: 'skipped', reason: `打开本机会话写入失败：${error instanceof Error ? error.message : String(error)}` }
+    }
+    try {
+      // Re-read under the write lock: the log may have moved between list()
+      // and ownership acquisition. Never append against a stale count.
+      const current = await writer.read()
+      const currentEvents = Array.isArray(current.events) ? current.events : []
+      if (currentEvents.length !== localCount || firstLineageMismatch(currentEvents, bundleEvents, localCount) >= 0) {
+        return { outcome: 'conflict', reason: '本机会话在导入过程中发生变化，已跳过' }
+      }
+      await writer.append(tail)
+      try {
+        await writer.flush()
+      } catch (flushError) {
+        // append is accepted before the durability barrier; if the tail is
+        // already visible the session was updated, so do not report a lie.
+        const after = await writer.read()
+        const afterEvents = Array.isArray(after.events) ? after.events : []
+        if (afterEvents.length !== bundleCount || firstLineageMismatch(afterEvents, bundleEvents, bundleCount) >= 0) {
+          throw flushError
+        }
+      }
+      return { outcome: 'updated', appended: tail.length, total: bundleCount, rewritten, attachmentGap }
+    } catch (error) {
+      return { outcome: 'skipped', reason: `追加事件失败：${error instanceof Error ? error.message : String(error)}` }
+    } finally {
+      try {
+        await writer.close()
+      } catch {
+        /* a closed writer already released ownership */
+      }
+    }
   }
 
   async function auditBundle(bundlePath) {
@@ -1767,8 +2043,12 @@ export function apply(ctx, config = {}) {
       workspaces: [],
       sessionsImported: 0,
       importedSessions: [],
+      sessionsUpdated: 0,
+      eventsAppended: 0,
+      sessionsUpToDate: 0,
+      updatedSessions: [],
       sessionsSkipped: [],
-      flattened: 0,
+      seeded: 0,
       ungrouped: 0,
       rewritten: 0,
       missingAttachments: 0,
@@ -1833,6 +2113,9 @@ export function apply(ctx, config = {}) {
 
     const existing = new Set(snapshots.map((snapshot) => String(snapshot.header.id)))
     const attached = new Set()
+    // Operator opt-out; default on, so a re-activated history updates without
+    // extra clicks. The UI checkbox and the HTTP body both carry this flag.
+    const mergeExisting = options.mergeExisting !== false
 
     for (const meta of manifest.sessions ?? []) {
       const id = String(meta.id)
@@ -1840,11 +2123,6 @@ export function apply(ctx, config = {}) {
       // anything outside the safe charset is refused up front.
       if (!isSafePathSegment(id)) {
         report.sessionsSkipped.push({ id, reason: '会话 id 含非法字符，已跳过' })
-        task.done += 1
-        continue
-      }
-      if (existing.has(id)) {
-        report.sessionsSkipped.push({ id, reason: '本机已存在同名会话' })
         task.done += 1
         continue
       }
@@ -1859,17 +2137,98 @@ export function apply(ctx, config = {}) {
           task.done += 1
           continue
         }
+        const events = Array.isArray(document.events) ? document.events : []
+        const header = {
+          ...document.header,
+          version: typeof localVersion === 'number' ? localVersion : document.header.version,
+        }
+        // DSH stores a seeded (fork) session as ONE full log: the inherited
+        // prefix, a `session/end-seed` marker at inheritedEventCount, then the
+        // child's own events. Import must preserve that shape by creating with
+        // the same inheritedEventCount — prepending the parent prefix again
+        // (the old flatten) duplicates events and breaks seq contiguity, so the
+        // backend refuses the whole append and the fork never arrives.
+        const seeded = Boolean(header.isSeeded)
+        const inheritedCount = Number(document.inheritedEventCount ?? 0)
+        if (seeded) {
+          if (
+            inheritedCount <= 0 ||
+            events.length <= inheritedCount ||
+            events[inheritedCount]?.type !== 'session/end-seed' ||
+            events[inheritedCount]?.data?.inherited !== true
+          ) {
+            report.sessionsSkipped.push({ id, reason: 'fork 会话缺少继承标记或继承前缀不完整，已跳过' })
+            task.done += 1
+            continue
+          }
+        } else if (inheritedCount !== 0) {
+          report.sessionsSkipped.push({ id, reason: '非 fork 会话带有继承计数，已跳过' })
+          task.done += 1
+          continue
+        }
+
+        // Re-activated historical session: the id already exists on this
+        // machine. Fast-forward only — append the unseen tail when the local
+        // log is a strict prefix of the bundle, otherwise leave it untouched.
+        if (existing.has(id)) {
+          if (!mergeExisting) {
+            report.sessionsSkipped.push({ id, reason: '同 id 会话已存在（本次已关闭增量更新）' })
+            task.done += 1
+            continue
+          }
+          const decision = await mergeStoredSession({
+            id,
+            bundleHeader: document.header,
+            bundleEvents: events,
+            pairs,
+            options,
+            willInstallAttachments,
+            formatMismatch:
+              typeof manifest.formatVersion === 'number' &&
+              typeof localVersion === 'number' &&
+              manifest.formatVersion !== localVersion,
+          })
+          if (decision.outcome === 'updated') {
+            report.sessionsUpdated += 1
+            report.eventsAppended += decision.appended
+            report.updatedSessions.push({ id, appended: decision.appended, total: decision.total })
+            report.rewritten += decision.rewritten
+            if (decision.attachmentGap) {
+              report.missingAttachments += 1
+              report.attachmentGaps.push({ id, ...decision.attachmentGap })
+            }
+            // The updated session may belong to a workspace created by this run.
+            const mappedCwd = document.header?.cwd ? mapPath(String(document.header.cwd), pairs) : ''
+            const match = mappedCwd
+              ? created.find((entry) => normalKey(mappedCwd) === normalKey(entry.target))
+              : undefined
+            if (match && !attached.has(`${match.entity.id}:${id}`)) {
+              try {
+                await match.entity.attachSession(id)
+                attached.add(`${match.entity.id}:${id}`)
+              } catch (error) {
+                report.warnings.push(`会话 ${id} 归属到项目失败：${error instanceof Error ? error.message : String(error)}`)
+              }
+            } else if (!match) {
+              report.ungrouped += 1
+            }
+          } else if (decision.outcome === 'upToDate') {
+            report.sessionsUpToDate += 1
+          } else {
+            report.sessionsSkipped.push({ id, reason: decision.reason })
+          }
+          task.done += 1
+          task.message = `增量更新 ${report.sessionsUpdated} 个会话（追加 ${report.eventsAppended} 事件）· 已最新 ${report.sessionsUpToDate}`
+          continue
+        }
+
+        // New session on this machine: persist it through the public service.
         if (!willInstallAttachments) {
           const audit = auditDocument(document)
           if (audit.missing > 0) {
             report.missingAttachments += 1
             report.attachmentGaps.push({ id, missing: audit.missing, total: audit.refs })
           }
-        }
-        let events = Array.isArray(document.events) ? document.events : []
-        let header = {
-          ...document.header,
-          version: typeof localVersion === 'number' ? localVersion : document.header.version,
         }
         if (header.cwd) {
           header.cwd = mapPath(header.cwd, pairs)
@@ -1881,8 +2240,9 @@ export function apply(ctx, config = {}) {
             }
           }
         }
-
         // Historical tool calls and results still name the old machine's paths.
+        // A seeded log's inherited prefix is a real copy inside this session,
+        // so it is rewritten too (the old flatten only rewrote own events).
         if (options.rewritePaths !== false && pairs.length > 0) {
           const stats = { count: 0 }
           for (const event of events) {
@@ -1892,35 +2252,17 @@ export function apply(ctx, config = {}) {
           }
           report.rewritten += stats.count
         }
-
-        if (header.isSeeded) {
-          const inherited = Number(document.inheritedEventCount ?? 0)
-          const parentId = header.parentSession ? String(header.parentSession) : null
-          const parentMeta = parentId ? (manifest.sessions ?? []).find((entry) => String(entry.id) === parentId) : null
-          if (!parentMeta || inherited <= 0) {
-            report.sessionsSkipped.push({ id, reason: 'fork 会话缺少父会话种子，已跳过' })
-            task.done += 1
-            continue
-          }
-          const parentDocument = await loadSessionDocument(dir, parentMeta)
-          const parentEvents = Array.isArray(parentDocument.events) ? parentDocument.events : []
-          if (parentEvents.length < inherited) {
-            report.sessionsSkipped.push({ id, reason: 'fork 会话的父会话事件不足，已跳过' })
-            task.done += 1
-            continue
-          }
-          events = [...parentEvents.slice(0, inherited), ...events]
-          header = { ...header, isSeeded: false, parentSession: undefined, origin: undefined, delegationDepth: undefined }
-          report.flattened += 1
-        }
-
-        const handle = await ctx.sessionPersistence.create(header)
+        const handle = await ctx.sessionPersistence.create(
+          header,
+          seeded ? { inheritedEventCount: inheritedCount } : undefined,
+        )
         try {
           if (events.length > 0) await handle.append(events)
           await handle.flush()
         } finally {
           await handle.close()
         }
+        if (seeded) report.seeded += 1
         existing.add(id)
         createdSessions.add(id)
         report.sessionsImported += 1
@@ -2216,6 +2558,8 @@ export function apply(ctx, config = {}) {
             sessionsSkipped: { type: 'array', items: { type: 'object' } },
             sessionsUnexported: { type: 'array', items: { type: 'object' } },
             sessionsReused: { type: 'integer' },
+            sessionsUpdated: { type: 'integer' },
+            eventsAdded: { type: 'integer' },
             sessionsWouldReuse: { type: 'integer' },
             workspaces: { type: 'integer' },
             bytes: { type: 'integer' },
