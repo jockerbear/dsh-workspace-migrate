@@ -26,8 +26,8 @@
         "zh": "备份与迁移"
       },
       "description": {
-        "en": "Package selected workspaces, their conversations, project files and image attachments into one folder, then restore them on another machine with an editable path map.",
-        "zh": "把选中的工作区连同会话、项目文件与图片附件打成一个文件夹，在新机器上按可编辑的路径映射还原。"
+        "en": "Package selected workspaces, their conversations, project files and image attachments into one folder, then restore them on another machine with an editable path map; re-importing fast-forwards sessions that were resumed on the old machine.",
+        "zh": "把选中的工作区连同会话、项目文件与图片附件打成一个文件夹，在新机器上按可编辑的路径映射还原；旧机器上重新激活的会话再次导入时会快进追加新消息。"
       },
       "author": "jockerbear",
       "homepage": "https://github.com/jockerbear/dsh-workspace-migrate",
@@ -45,12 +45,12 @@
       },
       "versions": [
         {
-          "version": "0.6.1",
-          "publishTimestamp": 1794580811,
+          "version": "0.7.0",
+          "publishTimestamp": 1794728455,
           "source": {
             "type": "git",
             "url": "https://github.com/jockerbear/dsh-workspace-migrate",
-            "commit": "163b9203937cbb83f0f63e993460eca7fba475b9"
+            "commit": "d858ca061d8f90f7208990c20fa12114d40e45e0"
           },
           "engines": {
             "dsh": "^0.2.1-rc.2"
